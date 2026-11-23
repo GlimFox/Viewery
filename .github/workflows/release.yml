@@ -49,7 +49,7 @@ jobs:
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.number }}
         run: |
-          cmake -S . -B build -G 'Visual Studio 17 2022' -A x64 -T v143 -DCMAKE_SYSTEM_VERSION=10.0.26100.0 -DVIEWERY_MEDIA_TESTS=ON "-DVIEWERY_VERSION=$env:RELEASE_VERSION"
+          cmake -S . -B build -G 'Visual Studio 17 2022' -A x64 -T v143 -DCMAKE_SYSTEM_VERSION=10.0.26100.0 -DVIEWERY_MEDIA_TESTS=ON -DVIEWERY_GUI_TESTS=ON "-DVIEWERY_VERSION=$env:RELEASE_VERSION"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build --config Release --parallel
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -10,6 +10,7 @@ namespace viewery {
 
 class RenameStudio {
 public:
+    static constexpr UINT closeCommandId = 1051;
     using BeforeFilesChange = std::function<void()>;
     RenameStudio(HWND owner, UINT changedMessage, BeforeFilesChange beforeChange,
                  std::filesystem::path database = {});

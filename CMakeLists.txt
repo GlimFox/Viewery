@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 project(Viewery VERSION 0.2.0 LANGUAGES CXX)
-set(VIEWERY_VERSION "0.2.0-beta.1" CACHE STRING "Semantic version published by Viewery")
+set(VIEWERY_VERSION "0.2.0-beta.2" CACHE STRING "Semantic version published by Viewery")
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR NOT MSVC)
     message(FATAL_ERROR "Viewery requires Windows x64 and the Microsoft C++ toolchain.")
 endif()
@@ -83,14 +83,41 @@ if(BUILD_TESTING AND VIEWERY_MEDIA_TESTS)
     set_tests_properties(playback gif-export PROPERTIES FIXTURES_REQUIRED media TIMEOUT 60)
 endif()
 
-option(VIEWERY_GUI_TESTS "Enable isolated native Rename Studio GUI checks" OFF)
+option(VIEWERY_GUI_TESTS "Enable isolated native UI regression checks" OFF)
 if(BUILD_TESTING AND VIEWERY_GUI_TESTS)
     add_executable(viewery-rename-studio-tests tests/rename_studio_smoke.cpp
-        src/rename_studio.cpp src/rename_template.cpp src/library.cpp src/frame_image.cpp)
+        src/rename_studio.cpp src/rename_template.cpp src/library.cpp src/frame_image.cpp src/Viewery.rc)
     viewery_target(viewery-rename-studio-tests)
+    target_link_options(viewery-rename-studio-tests PRIVATE /MANIFEST:NO)
     target_link_libraries(viewery-rename-studio-tests PRIVATE
         comctl32 uxtheme user32 gdi32 ole32 shell32 windowscodecs bcrypt)
     add_test(NAME rename-studio-gui COMMAND viewery-rename-studio-tests
         "${CMAKE_BINARY_DIR}/studio-gui-test-data")
     set_tests_properties(rename-studio-gui PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+endif()
+
+if(BUILD_TESTING AND VIEWERY_GUI_TESTS)
+    set(main_ui_source "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${main_ui_source}")
+    file(READ "${main_ui_source}" main_ui_code)
+    string(REPLACE "\r\n" "\n" main_ui_code "${main_ui_code}")
+    set(main_ui_private "private:\n    bool makeViewer();")
+    string(FIND "${main_ui_code}" "${main_ui_private}" main_ui_private_at)
+    if(main_ui_private_at LESS 0)
+        message(FATAL_ERROR "The main UI test expects the App makeViewer access marker.")
+    endif()
+    string(REPLACE "${main_ui_private}" "public:\n    bool makeViewer();" main_ui_code "${main_ui_code}")
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/main_ui_source.inc" "${main_ui_code}")
+    add_executable(viewery-main-ui-tests tests/main_ui_smoke.cpp
+        src/catalog.cpp src/media.cpp src/explorer.cpp src/converter.cpp src/frame_image.cpp
+        src/library.cpp src/rename_template.cpp src/rename_studio.cpp src/updater.cpp
+        src/runtime_paths.cpp src/collection_view.cpp src/Viewery.rc)
+    viewery_target(viewery-main-ui-tests)
+    target_include_directories(viewery-main-ui-tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    target_link_options(viewery-main-ui-tests PRIVATE /MANIFEST:NO)
+    target_link_libraries(viewery-main-ui-tests PRIVATE advapi32 comctl32 dwmapi gdi32 ole32 oleaut32
+        shell32 shlwapi user32 uuid windowscodecs bcrypt winhttp windowsapp runtimeobject uxtheme)
+    add_test(NAME main-window-gui COMMAND viewery-main-ui-tests "${CMAKE_BINARY_DIR}/main-ui-test-data")
+    set_tests_properties(main-window-gui PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 endif()

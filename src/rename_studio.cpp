@@ -29,7 +29,8 @@ enum Id {
     blocks, blockKind, blockAdd, blockRemove, blockUp, blockDown, blockText, blockDigits,
     blockPrefix, blockSuffix, blockFallback, blockCase, blockApply, authorJoin,
     counterStart, counterScope, previewList, previewSearch, newName, editName, makePreview,
-    apply, historyList, undo, recover, cancelTask, dbBackup, metaExport, metaImport, historyDetails
+    apply, historyList, undo, recover, cancelTask, dbBackup, metaExport, metaImport, historyDetails,
+    closePanel, advancedToggle, presetMenu, liveExample, scrollViewport, scrollContent, newPreset
 };
 std::wstring text(HWND control) {
     std::wstring result(static_cast<std::size_t>(GetWindowTextLengthW(control))+1,L'\0');
@@ -109,14 +110,16 @@ void fill(HDC dc,RECT rect,COLORREF color) {
 }
 
 struct RenameStudio::Impl {
-    HWND owner=nullptr,window=nullptr;
+    HWND owner=nullptr,window=nullptr,viewport=nullptr,content=nullptr,tips=nullptr;
     UINT changed=0,dpi=96;
     HFONT font=nullptr;
     HBRUSH brush=CreateSolidBrush(bg),editBrush=CreateSolidBrush(inputColor);
     std::map<int,HWND> controls;
     std::vector<HWND> labels;
-    int tab=0,dragBlock=-1,scrollOffset=0,scrollLimit=0;
-    bool filling=false,indexPending=false;
+    int tab=0,dragBlock=-1,scrollOffset=0,scrollLimit=0,contentHeight=0;
+    POINT dragOrigin{};
+    bool filling=false,indexPending=false,layingOut=false,dragging=false,advanced=false;
+    std::size_t captionIndex=0;
     std::uint64_t selectionGeneration=0,directoryGeneration=0;
     std::vector<fs::path> directory,selection,indexed;
     CollectionSnapshot data;
@@ -133,25 +136,49 @@ struct RenameStudio::Impl {
     BeforeFilesChange before;
     std::optional<RenameResult> fileResult;
     std::wstring resultMessage;
+    std::wstring tooltipText;
     int dp(int value) const { return MulDiv(value,static_cast<int>(dpi),96); }
     HWND c(int id) const { const auto found=controls.find(id);return found==controls.end()?nullptr:found->second; }
     bool busy() const { return worker.joinable(); }
 
     Impl(HWND parent,UINT msg,BeforeFilesChange callback,fs::path databasePath)
         :owner(parent),changed(msg),database(std::move(databasePath)),before(std::move(callback)) {
-        static const ATOM klass=[] {
-            WNDCLASSW wc{};
-            wc.hInstance=GetModuleHandleW(nullptr);
-            wc.lpfnWndProc=procedure;
-            wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
-            wc.lpszClassName=L"Viewery.RenameStudio.1";
-            return RegisterClassW(&wc);
-        }();
-        if(!klass) throw LibraryError("Cannot register Rename Studio");
-        window=CreateWindowExW(WS_EX_CONTROLPARENT,L"Viewery.RenameStudio.1",L"Rename Studio",WS_CHILD|WS_CLIPCHILDREN|WS_VSCROLL,
-                               0,0,0,0,parent,nullptr,GetModuleHandleW(nullptr),this);
-        if(!window) throw LibraryError("Cannot create Rename Studio");
-        build();
+        try {
+            const INITCOMMONCONTROLSEX common{sizeof(common),ICC_LISTVIEW_CLASSES};
+            if(!InitCommonControlsEx(&common)) throw LibraryError("Cannot initialize native collection controls");
+            static const ATOM klass=[] {
+                WNDCLASSW wc{};
+                wc.hInstance=GetModuleHandleW(nullptr);
+                wc.lpfnWndProc=procedure;
+                wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
+                wc.lpszClassName=L"Viewery.RenameStudio.1";
+                return RegisterClassW(&wc);
+            }();
+            if(!klass) throw LibraryError("Cannot register Rename Studio");
+            window=CreateWindowExW(WS_EX_CONTROLPARENT,L"Viewery.RenameStudio.1",L"Rename Studio",WS_CHILD|WS_CLIPCHILDREN|WS_CLIPSIBLINGS,
+                                   0,0,0,0,parent,nullptr,GetModuleHandleW(nullptr),this);
+            if(!window) throw LibraryError("Cannot create Rename Studio");
+            viewport=CreateWindowExW(WS_EX_CONTROLPARENT,L"Viewery.RenameStudio.1",L"",WS_CHILD|WS_VISIBLE|WS_CLIPCHILDREN|WS_CLIPSIBLINGS|WS_VSCROLL,
+                0,0,0,0,window,reinterpret_cast<HMENU>(scrollViewport),GetModuleHandleW(nullptr),this);
+            content=CreateWindowExW(WS_EX_CONTROLPARENT,L"Viewery.RenameStudio.1",L"",WS_CHILD|WS_VISIBLE|WS_CLIPCHILDREN|WS_CLIPSIBLINGS,
+                0,0,0,0,viewport,reinterpret_cast<HMENU>(scrollContent),GetModuleHandleW(nullptr),this);
+            if(!viewport||!content) throw LibraryError("Cannot create Rename Studio viewport");
+            build();
+            tips=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,L"",WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,
+                CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,window,nullptr,GetModuleHandleW(nullptr),nullptr);
+            if(tips) {
+                SendMessageW(tips,TTM_SETMAXTIPWIDTH,0,500);
+                for(int id:{closePanel,preset,liveExample,status,blocks,blockUp,blockDown}) {
+                    TTTOOLINFOW info{sizeof(info)};info.uFlags=TTF_IDISHWND|TTF_SUBCLASS;info.hwnd=window;
+                    info.uId=reinterpret_cast<UINT_PTR>(c(id));info.lpszText=LPSTR_TEXTCALLBACKW;
+                    SendMessageW(tips,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&info));
+                }
+            }
+        } catch(...) {
+            if(window) DestroyWindow(window);
+            DeleteObject(brush);DeleteObject(editBrush);
+            throw;
+        }
     }
     ~Impl() {
         worker.request_stop();
@@ -169,8 +196,10 @@ struct RenameStudio::Impl {
         return self?self->dispatch(hwnd,msg,w,l):DefWindowProcW(hwnd,msg,w,l);
     }
     HWND create(int id,const wchar_t* type,const wchar_t* value,DWORD style) {
-        HWND result=CreateWindowExW(0,type,value,WS_CHILD|WS_TABSTOP|style,0,0,0,0,window,
+        const bool fixed=id<=status||id==closePanel||id==cancelTask;
+        HWND result=CreateWindowExW(0,type,value,WS_CHILD|WS_CLIPSIBLINGS|WS_TABSTOP|style,0,0,0,0,fixed?window:content,
                                     reinterpret_cast<HMENU>(static_cast<UINT_PTR>(id)),GetModuleHandleW(nullptr),nullptr);
+        if(!result) throw LibraryError("Cannot create Rename Studio control "+std::to_string(id));
         controls[id]=result;
         if(wcscmp(type,WC_LISTVIEWW)==0) {
             ListView_SetBkColor(result,bg);
@@ -179,12 +208,20 @@ struct RenameStudio::Impl {
             ListView_SetExtendedListViewStyle(result,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER);
         }
         SetWindowTheme(result,L"DarkMode_Explorer",nullptr);
+        SetWindowSubclass(result,inputProc,2,reinterpret_cast<DWORD_PTR>(this));
+        if(wcscmp(type,L"COMBOBOX")==0) {
+            COMBOBOXINFO info{sizeof(info)};
+            if(GetComboBoxInfo(result,&info)&&info.hwndItem&&info.hwndItem!=result) {
+                SetWindowSubclass(info.hwndItem,inputProc,2,reinterpret_cast<DWORD_PTR>(this));
+            }
+        }
         return result;
     }
     void button(int id,const wchar_t* value) { create(id,L"BUTTON",value,BS_OWNERDRAW); }
     void edit(int id,const wchar_t* value=L"",DWORD extra=0) { create(id,L"EDIT",value,ES_AUTOHSCROLL|extra); }
     void combo(int id,bool editable=false) {
-        create(id,L"COMBOBOX",L"",CBS_HASSTRINGS|WS_VSCROLL|(editable?CBS_DROPDOWN:CBS_DROPDOWNLIST));
+        create(id,L"COMBOBOX",L"",CBS_HASSTRINGS|WS_VSCROLL|
+            (editable?CBS_DROPDOWN:CBS_DROPDOWNLIST|CBS_OWNERDRAWFIXED));
     }
     void item(int id,const wchar_t* value) { SendMessageW(c(id),CB_ADDSTRING,0,reinterpret_cast<LPARAM>(value)); }
     void column(int id,int index,const wchar_t* name,int width) {
@@ -193,22 +230,23 @@ struct RenameStudio::Impl {
         ListView_InsertColumn(c(id),index,&col);
     }
     void build() {
-        button(tabAssign,L"Метаданные");button(tabTemplate,L"Шаблон");
-        button(tabPreview,L"Предпросмотр");button(tabHistory,L"История");
+        button(tabAssign,L"Данные");button(tabTemplate,L"Шаблон");
+        button(tabPreview,L"Имена");button(tabHistory,L"История");
+        button(closePanel,L"Закрыть");
         create(summary,L"STATIC",L"Выбрано 0 файлов",0);
         create(status,L"STATIC",L"",SS_LEFT);
         combo(artist,true);combo(work,true);edit(title);
         edit(workNumber);edit(versionNumber,L"1");
         combo(assignment);item(assignment,L"Отдельная работа для каждого файла");
-        item(assignment,L"Версии одной новой работы");item(assignment,L"Привязать к выбранной работе");
-        item(assignment,L"Назначить художников без изменения связей");
+        item(assignment,L"Версии одной новой работы");item(assignment,L"Добавить к существующей работе");
+        item(assignment,L"Только назначить художника");
         SendMessageW(c(assignment),CB_SETCURSEL,0,0);
         edit(aliases);edit(fields,L"",ES_MULTILINE|ES_WANTRETURN|WS_VSCROLL);
         button(assign,L"Назначить выбранным");
         button(dbBackup,L"Копия базы");button(metaExport,L"Экспорт JSON");button(metaImport,L"Импорт JSON");
         combo(preset,true);button(presetSave,L"Сохранить");button(presetDuplicate,L"Копия");
         button(presetDelete,L"Удалить");button(presetImport,L"Импорт");button(presetExport,L"Экспорт");
-        create(blocks,L"LISTBOX",L"",LBS_NOTIFY|WS_VSCROLL|LBS_NOINTEGRALHEIGHT);
+        create(blocks,L"LISTBOX",L"",LBS_NOTIFY|WS_VSCROLL|LBS_NOINTEGRALHEIGHT|LBS_OWNERDRAWFIXED|LBS_HASSTRINGS);
         combo(blockKind);
         for(int k=0;k<=static_cast<int>(NameBlockKind::separator);++k) {
             const auto name=std::wstring(nameBlockLabel(static_cast<NameBlockKind>(k)));
@@ -220,6 +258,9 @@ struct RenameStudio::Impl {
         combo(blockCase);item(blockCase,L"Как задано");item(blockCase,L"строчные");item(blockCase,L"ПРОПИСНЫЕ");
         SendMessageW(c(blockCase),CB_SETCURSEL,0,0);
         button(blockApply,L"Обновить блок");
+        button(advancedToggle,L"Дополнительные параметры  ▾");
+        button(presetMenu,L"···");
+        create(liveExample,L"STATIC",L"",SS_OWNERDRAW);
         edit(authorJoin,L" & ");edit(counterStart,L"1");combo(counterScope);
         item(counterScope,L"Общий счётчик");item(counterScope,L"По художнику");item(counterScope,L"По работе");
         SendMessageW(c(counterScope),CB_SETCURSEL,0,0);
@@ -234,89 +275,159 @@ struct RenameStudio::Impl {
         button(undo,L"Отменить операцию");button(recover,L"Восстановить");button(cancelTask,L"Отменить задачу");
         fillBlocks();fillGlobals();
     }
+    bool dropdownOpen() const {
+        for(int id:{artist,work,assignment,preset,blockKind,blockCase,counterScope}) {
+            if(SendMessageW(c(id),CB_GETDROPPEDSTATE,0,0)) return true;
+        }
+        return false;
+    }
+    void close() { PostMessageW(owner,WM_COMMAND,RenameStudio::closeCommandId,0); }
+    void scrollTo(int value) {
+        if(dropdownOpen()) return;
+        const int next=std::clamp(value,0,scrollLimit);
+        if(next==scrollOffset) return;
+        scrollOffset=next;
+        SetScrollPos(viewport,SB_VERT,scrollOffset,TRUE);
+        SetWindowPos(content,nullptr,0,-dp(scrollOffset),0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW);
+        RedrawWindow(viewport,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN);
+    }
     void position(int id,int x,int y,int width,int height,std::set<int>& visible) {
         visible.insert(id);
-        SetWindowPos(c(id),nullptr,dp(x),dp(y-scrollOffset),dp(width),dp(height),
-                     SWP_NOZORDER|SWP_NOACTIVATE|SWP_SHOWWINDOW);
-        const bool available=!busy()||id==cancelTask||id==summary||id==status;
+        SetWindowPos(c(id),nullptr,dp(x),dp(y),dp(std::max(1,width)),dp(std::max(1,height)),
+                     SWP_NOZORDER|SWP_NOACTIVATE|SWP_SHOWWINDOW|SWP_NOREDRAW);
+        const bool available=!busy()||id==cancelTask||id==closePanel||id<=status;
         EnableWindow(c(id),available);
     }
     void caption(const wchar_t* value,int x,int y,int width) {
-        const HWND label=CreateWindowExW(0,L"STATIC",value,WS_CHILD|WS_VISIBLE,dp(x),dp(y-scrollOffset),dp(width),dp(20),
-                                         window,nullptr,GetModuleHandleW(nullptr),nullptr);
+        HWND label=nullptr;
+        if(captionIndex<labels.size()) label=labels[captionIndex];
+        else {
+            label=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|WS_CLIPSIBLINGS,0,0,0,0,
+                                 content,nullptr,GetModuleHandleW(nullptr),nullptr);
+            labels.push_back(label);
+        }
+        ++captionIndex;
+        SetWindowTextW(label,value);
         SendMessageW(label,WM_SETFONT,reinterpret_cast<WPARAM>(font),FALSE);
-        labels.push_back(label);
+        SetWindowPos(label,nullptr,dp(x),dp(y),dp(std::max(1,width)),dp(21),
+                     SWP_NOZORDER|SWP_NOACTIVATE|SWP_SHOWWINDOW|SWP_NOREDRAW);
+    }
+    static bool numbered(NameBlockKind kind) {
+        return kind==NameBlockKind::workNumber||kind==NameBlockKind::version||kind==NameBlockKind::counter;
     }
     void layout() {
+        if(!viewport||!content||layingOut||dropdownOpen()) return;
+        layingOut=true;
         RECT rect{};GetClientRect(window,&rect);
         const int width=MulDiv(rect.right,96,static_cast<int>(dpi));
-        const int viewport=MulDiv(rect.bottom,96,static_cast<int>(dpi));
-        const int height=tab<=1?std::max(viewport,630):std::max(viewport,430);
-        scrollLimit=std::max(0,height-viewport);
+        const int height=MulDiv(rect.bottom,96,static_cast<int>(dpi));
+        const int bodyHeight=std::max(1,height-132);
+        SetWindowPos(viewport,nullptr,0,dp(82),rect.right,dp(bodyHeight),SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW);
+        contentHeight=tab==0?612:tab==1?(advanced?910:582):tab==2?std::max(460,bodyHeight):std::max(440,bodyHeight);
+        scrollLimit=std::max(0,contentHeight-bodyHeight);
         scrollOffset=std::clamp(scrollOffset,0,scrollLimit);
         SCROLLINFO scroll{sizeof(scroll),SIF_RANGE|SIF_PAGE|SIF_POS};
-        scroll.nMin=0;scroll.nMax=height-1;scroll.nPage=static_cast<UINT>(std::max(1,viewport));scroll.nPos=scrollOffset;
-        SetScrollInfo(window,SB_VERT,&scroll,TRUE);
-        for(HWND label:labels) DestroyWindow(label);
-        labels.clear();
+        scroll.nMin=0;scroll.nMax=contentHeight-1;scroll.nPage=static_cast<UINT>(bodyHeight);scroll.nPos=scrollOffset;
+        SetScrollInfo(viewport,SB_VERT,&scroll,TRUE);
+        RECT body{};GetClientRect(viewport,&body);
+        const int bodyWidth=MulDiv(body.right,96,static_cast<int>(dpi));
+        SetWindowPos(content,nullptr,0,-dp(scrollOffset),body.right,dp(contentHeight),SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW);
+        captionIndex=0;
         std::set<int> visible;
-        const auto put=[&](int id,int x,int y,int w,int h=28){position(id,x,y,w,h,visible);};
-        const int inside=width-24;
-        const int tabWidth=(inside-9)/4;
-        for(int index=0;index<4;++index) put(tabAssign+index,12+index*(tabWidth+3),10,tabWidth,29);
-        put(summary,12,46,inside,22);
-        put(status,12,height-49,inside,40);
-        if(tab==0) {
-            caption(L"Художники (соавторы через ;)",12,75,inside);
-            put(artist,12,96,inside,220);
-            caption(L"Псевдонимы художника",12,130,inside);put(aliases,12,151,inside);
-            caption(L"Работа (для существующей выберите из списка)",12,185,inside);put(work,12,206,inside,200);
-            caption(L"Название работы",12,240,inside);put(title,12,261,inside);
-            put(assignment,12,298,inside,140);
-            caption(L"№ работы (пусто — следующий)",12,333,inside/2);
-            caption(L"Первая версия",width/2+4,333,inside/2-4);
-            put(workNumber,12,354,inside/2-6);put(versionNumber,width/2+4,354,inside/2-4);
-            caption(L"Поля файлов · ключ=значение",12,388,inside);put(fields,12,409,inside,65);
-            put(assign,12,482,inside,32);
-            const int third=(inside-8)/3;
-            put(dbBackup,12,523,third);put(metaExport,16+third,523,third);put(metaImport,20+third*2,523,third);
-        } else if(tab==1) {
-            put(preset,12,75,inside,170);
-            const int fifth=(inside-12)/5;
-            int x=12;
-            for(int id:{presetSave,presetDuplicate,presetDelete,presetImport,presetExport}) {
-                put(id,x,110,fifth);x+=fifth+3;
-            }
-            put(blocks,12,147,inside-42,135);
-            put(blockUp,width-45,147,32);put(blockDown,width-45,181,32);put(blockRemove,width-83,251,70);
-            put(blockKind,12,290,inside-104,200);put(blockAdd,width-107,290,95);
-            caption(L"Текст / имя поля / формат даты",12,324,inside);put(blockText,12,344,inside);
-            caption(L"Цифры",12,379,70);put(blockDigits,12,399,60);
-            caption(L"Префикс",82,379,100);put(blockPrefix,82,399,96);
-            caption(L"Суффикс",188,379,100);put(blockSuffix,188,399,inside-176);
-            caption(L"Запасное значение",12,433,inside/2);put(blockFallback,12,453,inside/2-4);
-            put(blockCase,16+inside/2,453,inside/2-4,130);
-            put(blockApply,12,490,inside);
-            caption(L"Соавторы",12,524,100);put(authorJoin,12,544,90);
-            caption(L"Счётчик с",112,524,90);put(counterStart,112,544,70);
-            put(counterScope,192,544,inside-180,130);
-        } else if(tab==2) {
-            caption(L"Поиск по исходному или новому имени",12,75,inside);
-            put(previewSearch,12,96,inside);
-            put(previewList,12,132,inside,std::max(125,height-320));
-            const int y=height-178;
-            put(newName,12,y,inside);put(editName,12,y+34,inside);
-            put(makePreview,12,y+68,inside/2-4);put(apply,16+inside/2,y+68,inside/2-4,31);
-            put(cancelTask,12,y+103,inside);
-        } else {
-            const int listHeight=std::max(140,height-355);
-            put(historyList,12,80,inside,listHeight);
-            put(historyDetails,12,88+listHeight,inside,112);
-            put(undo,12,height-146,inside/2-4);put(recover,16+inside/2,height-146,inside/2-4);
-            put(cancelTask,12,height-110,inside);
+        const auto put=[&](int id,int x,int y,int w,int h=30){position(id,x,y,w,h,visible);};
+        const int inside=std::max(1,bodyWidth-24);
+        for(int id:{artist,work,assignment,preset,blockKind,blockCase,counterScope}) {
+            SendMessageW(c(id),CB_SETDROPPEDWIDTH,dp(std::max(inside,410)),0);
         }
+        put(summary,12,12,std::max(1,width-112),23);
+        put(closePanel,std::max(12,width-94),7,82,31);
+        const int tabWidth=std::max(1,(width-33)/4);
+        for(int index=0;index<4;++index) put(tabAssign+index,12+index*(tabWidth+3),43,tabWidth,29);
+        put(status,12,std::max(0,height-42),std::max(1,width-(busy()?150:24)),38);
+        if(busy()) put(cancelTask,std::max(12,width-132),std::max(0,height-39),120,30);
+        if(tab==0) {
+            caption(L"Художник · соавторов разделяйте ;",12,6,inside);
+            put(artist,12,29,inside,210);
+            caption(L"Что сделать с выбранными файлами",12,68,inside);
+            put(assignment,12,91,inside,180);
+            caption(L"Существующая работа",12,130,inside);
+            put(work,12,153,inside,210);
+            caption(L"Название работы",12,192,inside);put(title,12,215,inside);
+            const int half=(inside-12)/2;
+            caption(L"№ работы · авто",12,255,half);
+            caption(L"Первая версия",24+half,255,half);
+            put(workNumber,12,278,half);put(versionNumber,24+half,278,half);
+            caption(L"Псевдонимы художника",12,318,inside);put(aliases,12,341,inside);
+            caption(L"Поля файлов · ключ=значение",12,381,inside);
+            put(fields,12,404,inside,73);
+            put(assign,12,490,inside,34);
+            const int third=(inside-12)/3;
+            put(dbBackup,12,538,third);put(metaExport,18+third,538,third);put(metaImport,24+third*2,538,third);
+        } else if(tab==1) {
+            caption(L"Пресет · выберите или введите своё имя",12,6,inside);
+            put(preset,12,29,std::max(1,inside-146),210);
+            put(presetSave,bodyWidth-150,29,96);put(presetMenu,bodyWidth-48,29,36);
+            caption(L"Будущее имя · пример выбранного файла",12,72,inside);
+            put(liveExample,12,96,inside,45);
+            caption(L"Порядок частей имени",12,151,inside);
+            put(blocks,12,176,inside,160);
+            put(blockUp,12,344,42);put(blockDown,60,344,42);put(blockRemove,108,344,100);
+            put(blockKind,12,384,std::max(1,inside-108),240);put(blockAdd,bodyWidth-112,384,100);
+            const int selected=static_cast<int>(SendMessageW(c(blocks),LB_GETCURSEL,0,0));
+            int y=427;
+            if(selected>=0&&selected<static_cast<int>(naming.blocks.size())) {
+                const auto kind=naming.blocks[static_cast<std::size_t>(selected)].kind;
+                if(numbered(kind)) {
+                    caption(L"Знаков в номере · 3 → 001",12,y,inside);put(blockDigits,12,y+23,104);
+                    y+=62;
+                } else if(kind==NameBlockKind::literal||kind==NameBlockKind::separator||kind==NameBlockKind::customField||kind==NameBlockKind::date) {
+                    const wchar_t* label=kind==NameBlockKind::customField?L"Имя пользовательского поля":kind==NameBlockKind::date?L"Формат даты · например %Y-%m-%d":L"Текст разделителя или части имени";
+                    caption(label,12,y,inside);put(blockText,12,y+23,inside);y+=62;
+                } else {
+                    caption(L"Значение берётся из метаданных файла",12,y,inside);y+=32;
+                }
+            } else {caption(L"Выберите часть имени, чтобы настроить её",12,y,inside);y+=32;}
+            put(advancedToggle,12,y,inside);y+=42;
+            if(advanced) {
+                const int half=(inside-12)/2;
+                caption(L"Текст перед частью",12,y,half);caption(L"Текст после части",24+half,y,half);
+                put(blockPrefix,12,y+23,half);put(blockSuffix,24+half,y+23,half);y+=62;
+                caption(L"Если значение пустое",12,y,inside);put(blockFallback,12,y+23,inside);y+=62;
+                caption(L"Регистр текста",12,y,inside);put(blockCase,12,y+23,inside,160);y+=62;
+                caption(L"Разделитель соавторов",12,y,half);caption(L"Счётчик начинается с",24+half,y,half);
+                put(authorJoin,12,y+23,half);put(counterStart,24+half,y+23,half);y+=62;
+                caption(L"Область счётчика",12,y,inside);put(counterScope,12,y+23,inside,160);y+=62;
+            }
+            put(makePreview,12,y,inside,34);
+            SetWindowTextW(c(makePreview),L"Проверить будущие имена →");
+            SetWindowTextW(c(advancedToggle),advanced?L"Дополнительные параметры  ▴":L"Дополнительные параметры  ▾");
+        } else if(tab==2) {
+            caption(L"Поиск по исходному или новому имени",12,6,inside);
+            put(previewSearch,12,29,inside);
+            const int listHeight=std::max(146,contentHeight-252);
+            put(previewList,12,70,inside,listHeight);
+            caption(L"Новое имя выбранной строки",12,82+listHeight,inside);
+            put(newName,12,105+listHeight,std::max(1,inside-116));put(editName,bodyWidth-120,105+listHeight,108);
+            put(makePreview,12,147+listHeight,(inside-8)/2,34);put(apply,20+(inside-8)/2,147+listHeight,(inside-8)/2,34);
+            SetWindowTextW(c(makePreview),L"Обновить имена");
+        } else {
+            const int listHeight=std::max(140,contentHeight-248);
+            put(historyList,12,6,inside,listHeight);
+            caption(L"Пути выбранной операции",12,18+listHeight,inside);
+            put(historyDetails,12,41+listHeight,inside,108);
+            put(undo,12,161+listHeight,(inside-8)/2,34);put(recover,20+(inside-8)/2,161+listHeight,(inside-8)/2,34);
+        }
+        for(std::size_t i=captionIndex;i<labels.size();++i) ShowWindow(labels[i],SW_HIDE);
         for(const auto& [id,control]:controls) if(!visible.contains(id)) ShowWindow(control,SW_HIDE);
-        InvalidateRect(window,nullptr,FALSE);
+        if(c(previewList)) {
+            const int usable=std::max(dp(250),dp(inside)-GetSystemMetrics(SM_CXVSCROLL)-4);
+            ListView_SetColumnWidth(c(previewList),0,usable*35/100);ListView_SetColumnWidth(c(previewList),1,usable*41/100);
+            ListView_SetColumnWidth(c(previewList),2,usable*24/100);
+            ListView_SetColumnWidth(c(historyList),0,usable*48/100);ListView_SetColumnWidth(c(historyList),1,usable*32/100);
+            ListView_SetColumnWidth(c(historyList),2,usable*20/100);
+        }
+        layingOut=false;
+        RedrawWindow(window,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN);
     }
     struct JobResult {
         CollectionSnapshot snapshot;
@@ -397,6 +508,7 @@ struct RenameStudio::Impl {
         const auto value=L"Выбрано файлов   "+std::to_wstring(selection.size());
         SetWindowTextW(c(summary),value.c_str());
         preview.clear();fillPreview();
+        updateExample();
     }
     void fillMetadata() {
         filling=true;
@@ -438,40 +550,74 @@ struct RenameStudio::Impl {
         }
     }
     void fillBlocks() {
+        const bool wasFilling=std::exchange(filling,true);
         const auto selected=static_cast<int>(SendMessageW(c(blocks),LB_GETCURSEL,0,0));
+        const auto top=SendMessageW(c(blocks),LB_GETTOPINDEX,0,0);
+        const bool wasVisible=(GetWindowLongPtrW(c(blocks),GWL_STYLE)&WS_VISIBLE)!=0;
+        SendMessageW(c(blocks),WM_SETREDRAW,FALSE,0);
         SendMessageW(c(blocks),LB_RESETCONTENT,0,0);
         for(const auto& block:naming.blocks) {
             auto label=std::wstring(nameBlockLabel(block.kind));
             if(!block.text.empty()) label+=L"  "+block.text;
-            if(block.digits>0) label+=L" ["+std::to_wstring(block.digits)+L"]";
+            if(block.digits>0) label+=L" · "+std::wstring(static_cast<std::size_t>(std::max(0,block.digits-1)),L'0')+L"1";
             SendMessageW(c(blocks),LB_ADDSTRING,0,reinterpret_cast<LPARAM>(label.c_str()));
         }
-        if(selected>=0&&selected<static_cast<int>(naming.blocks.size())) SendMessageW(c(blocks),LB_SETCURSEL,selected,0);
+        if(!naming.blocks.empty()) SendMessageW(c(blocks),LB_SETCURSEL,std::clamp(selected,0,static_cast<int>(naming.blocks.size())-1),0);
+        SendMessageW(c(blocks),LB_SETTOPINDEX,top,0);
+        SendMessageW(c(blocks),WM_SETREDRAW,TRUE,0);
+        if(!wasVisible) ShowWindow(c(blocks),SW_HIDE);
+        InvalidateRect(c(blocks),nullptr,TRUE);
+        filling=wasFilling;
+        updateExample();
     }
     void fillGlobals() {
+        const bool wasFilling=std::exchange(filling,true);
         SetWindowTextW(c(authorJoin),naming.authorSeparator.c_str());
         SetWindowTextW(c(counterStart),std::to_wstring(naming.counterStart).c_str());
         SendMessageW(c(counterScope),CB_SETCURSEL,static_cast<WPARAM>(naming.counterScope),0);
+        filling=wasFilling;
+        updateExample();
     }
     void selectBlock() {
         const auto index=static_cast<int>(SendMessageW(c(blocks),LB_GETCURSEL,0,0));
         if(index<0||index>=static_cast<int>(naming.blocks.size())) return;
+        const bool wasFilling=std::exchange(filling,true);
         const auto& block=naming.blocks[static_cast<std::size_t>(index)];
         SetWindowTextW(c(blockText),block.text.c_str());SetWindowTextW(c(blockDigits),std::to_wstring(block.digits).c_str());
         SetWindowTextW(c(blockPrefix),block.prefix.c_str());SetWindowTextW(c(blockSuffix),block.suffix.c_str());
         SetWindowTextW(c(blockFallback),block.fallback.c_str());
         SendMessageW(c(blockCase),CB_SETCURSEL,static_cast<WPARAM>(block.letterCase),0);
+        filling=wasFilling;
+        layout();
+    }
+    void updateExample() {
+        if(!c(liveExample)) return;
+        try {
+            auto value=naming;
+            value.authorSeparator=text(c(authorJoin));value.counterStart=integer(c(counterStart),1);
+            const auto scope=SendMessageW(c(counterScope),CB_GETCURSEL,0,0);
+            if(scope>=0) value.counterScope=static_cast<CounterScope>(scope);
+            const auto sample=std::ranges::find_if(data.files,[&](const MediaRecord& file) {
+                return std::ranges::find(selection,file.path)!=selection.end();
+            });
+            const auto result=sample!=data.files.end()?renderName(value,data,*sample):L"Выберите файл в каталоге, чтобы увидеть пример";
+            SetWindowTextW(c(liveExample),result.c_str());
+        } catch(const std::exception&) {SetWindowTextW(c(liveExample),L"Проверьте параметры выбранной части имени");}
+    }
+    void templateChanged() {
+        preview.clear();fillPreview();updateExample();
     }
     void applyBlock() {
         const auto index=static_cast<int>(SendMessageW(c(blocks),LB_GETCURSEL,0,0));
         if(index<0||index>=static_cast<int>(naming.blocks.size())) return;
         auto block=naming.blocks[static_cast<std::size_t>(index)];
         block.text=text(c(blockText));block.digits=static_cast<int>(integer(c(blockDigits),0));
-        if(block.digits>12) throw LibraryError("Use at most 12 digits");
+        if(block.digits>12) throw LibraryError("Количество знаков: от 0 до 12");
         block.prefix=text(c(blockPrefix));block.suffix=text(c(blockSuffix));block.fallback=text(c(blockFallback));
         block.letterCase=static_cast<NameCase>(SendMessageW(c(blockCase),CB_GETCURSEL,0,0));
         naming.blocks[static_cast<std::size_t>(index)]=std::move(block);
         fillBlocks();
+        templateChanged();
     }
     void assignMetadata() {
         const auto selected=selectedRecords();
@@ -664,10 +810,24 @@ struct RenameStudio::Impl {
         },L"Восстановление имён…");
     }
     void command(int id,int notification) {
-        if(id>=tabAssign&&id<=tabHistory) {tab=id-tabAssign;scrollOffset=0;layout();return;}
+        if(id==closePanel) {close();return;}
+        if(filling) return;
+        if(notification==CBN_CLOSEUP) {layout();return;}
+        if(id>=tabAssign&&id<=tabHistory) {
+            tab=id-tabAssign;scrollOffset=0;
+            if(tab==1) selectBlock();
+            layout();return;
+        }
         if(id==previewSearch&&notification==EN_CHANGE) {fillPreview();return;}
         if(id==cancelTask&&notification==BN_CLICKED) {worker.request_stop();return;}
         if(busy()) return;
+        if((id==blockText||id==blockDigits||id==blockPrefix||id==blockSuffix||id==blockFallback)&&notification==EN_CHANGE) {
+            applyBlock();return;
+        }
+        if(id==blockCase&&notification==CBN_SELCHANGE) {applyBlock();return;}
+        if(((id==authorJoin||id==counterStart)&&notification==EN_CHANGE)||(id==counterScope&&notification==CBN_SELCHANGE)) {
+            templateChanged();return;
+        }
         if(id==work&&(notification==CBN_SELCHANGE||notification==CBN_EDITCHANGE)) {
             const auto row=SendMessageW(c(work),CB_GETCURSEL,0,0);
             selectedWorkId=notification==CBN_SELCHANGE&&row>=0&&row<static_cast<LRESULT>(data.artworks.size())
@@ -678,13 +838,28 @@ struct RenameStudio::Impl {
             const auto index=SendMessageW(c(preset),CB_GETCURSEL,0,0);
             if(index>=0&&index<static_cast<LRESULT>(presets.size())) {
                 const auto& saved=presets[static_cast<std::size_t>(index)];
-                naming=parseTemplate(utf8(saved.json));naming.id=saved.id;fillBlocks();fillGlobals();
+                naming=parseTemplate(utf8(saved.json));naming.id=saved.id;fillBlocks();fillGlobals();selectBlock();templateChanged();
             }
             return;
         }
         if(id==blocks&&notification==LBN_SELCHANGE) {selectBlock();return;}
         if(notification!=BN_CLICKED) return;
         switch(id) {
+        case advancedToggle:advanced=!advanced;layout();break;
+        case presetMenu: {
+            RECT bounds{};GetWindowRect(c(presetMenu),&bounds);
+            HMENU menu=CreatePopupMenu();
+            const auto add=[&](int commandId,const wchar_t* label){AppendMenuW(menu,MF_STRING,commandId,label);};
+            add(newPreset,L"Новый шаблон");add(presetDuplicate,L"Сохранить копию");add(presetDelete,L"Удалить пресет");
+            AppendMenuW(menu,MF_SEPARATOR,0,nullptr);add(presetImport,L"Импорт JSON…");add(presetExport,L"Экспорт JSON…");
+            const int chosen=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_NONOTIFY,bounds.right,bounds.bottom,0,window,nullptr);
+            DestroyMenu(menu);
+            if(chosen) command(chosen,BN_CLICKED);
+            break;
+        }
+        case newPreset:
+            naming=defaultArtistTemplate();naming.id.clear();naming.name=L"Новый шаблон";
+            SetWindowTextW(c(preset),naming.name.c_str());fillBlocks();fillGlobals();selectBlock();templateChanged();break;
         case assign:assignMetadata();break;
         case presetSave:savePreset(false);break;
         case presetDuplicate:savePreset(true);break;
@@ -693,7 +868,7 @@ struct RenameStudio::Impl {
             if(presetId.empty()) break;
             startJob([presetId](CollectionStore& db,std::stop_token){db.deletePreset(presetId);},L"Удаление пресета…");
             naming=defaultArtistTemplate();fillBlocks();fillGlobals();
-            SetWindowTextW(c(preset),naming.name.c_str());break;
+            SetWindowTextW(c(preset),naming.name.c_str());selectBlock();templateChanged();break;
         }
         case presetImport: {
             const auto path=pick(window,false,{});
@@ -701,7 +876,7 @@ struct RenameStudio::Impl {
             std::ifstream input(*path,std::ios::binary);
             const std::string contents((std::istreambuf_iterator<char>(input)),{});
             naming=parseTemplate(contents);naming.id.clear();
-            SetWindowTextW(c(preset),naming.name.c_str());fillBlocks();fillGlobals();break;
+            SetWindowTextW(c(preset),naming.name.c_str());fillBlocks();fillGlobals();selectBlock();templateChanged();break;
         }
         case presetExport: {
             auto value=naming;value.name=text(c(preset));value.authorSeparator=text(c(authorJoin));
@@ -718,25 +893,30 @@ struct RenameStudio::Impl {
             NameBlock block;
             block.kind=static_cast<NameBlockKind>(std::max<LRESULT>(0,SendMessageW(c(blockKind),CB_GETCURSEL,0,0)));
             if(block.kind==NameBlockKind::separator) block.text=L"_";
+            if(block.kind==NameBlockKind::workNumber||block.kind==NameBlockKind::counter) block.digits=3;
+            if(block.kind==NameBlockKind::version) {block.digits=2;block.prefix=L"v";}
+            if(block.kind==NameBlockKind::date) block.text=L"%Y-%m-%d";
             naming.blocks.push_back(block);fillBlocks();
-            SendMessageW(c(blocks),LB_SETCURSEL,naming.blocks.size()-1,0);selectBlock();break;
+            SendMessageW(c(blocks),LB_SETCURSEL,naming.blocks.size()-1,0);selectBlock();templateChanged();break;
         }
         case blockApply:applyBlock();break;
         case blockRemove: {
             const auto index=SendMessageW(c(blocks),LB_GETCURSEL,0,0);
             if(index>=0&&index<static_cast<LRESULT>(naming.blocks.size())) naming.blocks.erase(naming.blocks.begin()+index);
-            fillBlocks();break;
+            fillBlocks();selectBlock();templateChanged();break;
         }
         case blockUp:case blockDown: {
             const auto index=static_cast<int>(SendMessageW(c(blocks),LB_GETCURSEL,0,0));
             const auto next=index+(id==blockUp?-1:1);
             if(index>=0&&next>=0&&next<static_cast<int>(naming.blocks.size())) {
                 std::swap(naming.blocks[static_cast<std::size_t>(index)],naming.blocks[static_cast<std::size_t>(next)]);
-                fillBlocks();SendMessageW(c(blocks),LB_SETCURSEL,next,0);selectBlock();
+                fillBlocks();SendMessageW(c(blocks),LB_SETCURSEL,next,0);selectBlock();templateChanged();
             }
             break;
         }
-        case makePreview:createPreview();break;
+        case makePreview:
+            if(tab==1) {tab=2;scrollOffset=0;layout();}
+            createPreview();break;
         case editName: {
             const int row=ListView_GetNextItem(c(previewList),-1,LVNI_SELECTED);
             if(row<0||row>=static_cast<int>(shown.size())) break;
@@ -767,19 +947,62 @@ struct RenameStudio::Impl {
         default:break;
         }
     }
+    static LRESULT CALLBACK inputProc(HWND child,UINT msg,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR data) {
+        auto& self=*reinterpret_cast<Impl*>(data);
+        if(msg==WM_KEYDOWN&&w==VK_ESCAPE) {
+            if(self.dropdownOpen()) return DefSubclassProc(child,msg,w,l);
+            self.close();return 0;
+        }
+        if(msg==WM_MOUSEWHEEL) {
+            if(self.dropdownOpen()) return DefSubclassProc(child,msg,w,l);
+            wchar_t name[30]{};GetClassNameW(child,name,30);
+            if(wcscmp(name,L"SysListView32")==0) return DefSubclassProc(child,msg,w,l);
+            if(wcscmp(name,L"ListBox")==0||wcscmp(name,L"Edit")==0) {
+                SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE};
+                if(GetScrollInfo(child,SB_VERT,&info)&&info.nMax>=static_cast<int>(info.nPage)&&info.nPage>0) {
+                    return DefSubclassProc(child,msg,w,l);
+                }
+            }
+            return SendMessageW(self.viewport,WM_MOUSEWHEEL,w,l);
+        }
+        if(msg==WM_KEYDOWN&&GetDlgCtrlID(child)==blocks&&!self.busy()) {
+            if(w==VK_DELETE) {self.command(blockRemove,BN_CLICKED);return 0;}
+            if((w==VK_UP||w==VK_DOWN)&&(GetKeyState(VK_CONTROL)&0x8000)) {
+                self.command(w==VK_UP?blockUp:blockDown,BN_CLICKED);return 0;
+            }
+        }
+        return DefSubclassProc(child,msg,w,l);
+    }
     static LRESULT CALLBACK blocksProc(HWND child,UINT msg,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR data) {
         auto& self=*reinterpret_cast<Impl*>(data);
         if(msg==WM_LBUTTONDOWN&&!self.busy()) {
-            self.dragBlock=LOWORD(SendMessageW(child,LB_ITEMFROMPOINT,0,l));
+            const auto hit=SendMessageW(child,LB_ITEMFROMPOINT,0,l);
+            self.dragBlock=HIWORD(hit)==0?static_cast<int>(LOWORD(hit)):-1;
+            self.dragOrigin={GET_X_LPARAM(l),GET_Y_LPARAM(l)};
+            self.dragging=false;
+        } else if(msg==WM_MOUSEMOVE&&self.dragBlock>=0&&(w&MK_LBUTTON)&&!self.busy()) {
+            if(!self.dragging&&(abs(GET_X_LPARAM(l)-self.dragOrigin.x)>=GetSystemMetrics(SM_CXDRAG)||
+                abs(GET_Y_LPARAM(l)-self.dragOrigin.y)>=GetSystemMetrics(SM_CYDRAG))) {
+                self.dragging=true;SetCapture(child);
+            }
+            if(self.dragging) {SetCursor(LoadCursorW(nullptr,IDC_SIZEALL));return 0;}
         } else if(msg==WM_LBUTTONUP&&self.dragBlock>=0&&!self.busy()) {
             const int from=std::exchange(self.dragBlock,-1);
-            const int to=LOWORD(SendMessageW(child,LB_ITEMFROMPOINT,0,l));
-            if(from!=to&&from<static_cast<int>(self.naming.blocks.size())&&to<static_cast<int>(self.naming.blocks.size())) {
-                auto block=std::move(self.naming.blocks[static_cast<std::size_t>(from)]);
-                self.naming.blocks.erase(self.naming.blocks.begin()+from);
-                self.naming.blocks.insert(self.naming.blocks.begin()+to,std::move(block));
-                self.fillBlocks();SendMessageW(child,LB_SETCURSEL,to,0);self.selectBlock();
+            const bool wasDragging=std::exchange(self.dragging,false);
+            if(wasDragging) {
+                const auto hit=SendMessageW(child,LB_ITEMFROMPOINT,0,l);
+                const int to=static_cast<int>(LOWORD(hit));
+                ReleaseCapture();
+                if(HIWORD(hit)==0&&from!=to&&from>=0&&from<static_cast<int>(self.naming.blocks.size())&&to<static_cast<int>(self.naming.blocks.size())) {
+                    auto block=std::move(self.naming.blocks[static_cast<std::size_t>(from)]);
+                    self.naming.blocks.erase(self.naming.blocks.begin()+from);
+                    self.naming.blocks.insert(self.naming.blocks.begin()+to,std::move(block));
+                    self.fillBlocks();SendMessageW(child,LB_SETCURSEL,to,0);self.selectBlock();self.templateChanged();
+                }
+                return 0;
             }
+        } else if(msg==WM_CAPTURECHANGED&&reinterpret_cast<HWND>(l)!=child) {
+            self.dragBlock=-1;self.dragging=false;
         }
         return DefSubclassProc(child,msg,w,l);
     }
@@ -788,22 +1011,34 @@ struct RenameStudio::Impl {
             switch(msg) {
             case WM_VSCROLL: {
                 SCROLLINFO scroll{sizeof(scroll),SIF_TRACKPOS};
-                GetScrollInfo(hwnd,SB_VERT,&scroll);
+                GetScrollInfo(viewport,SB_VERT,&scroll);
                 const int action=LOWORD(w);
-                if(action==SB_LINEUP) scrollOffset-=28;
-                if(action==SB_LINEDOWN) scrollOffset+=28;
-                if(action==SB_PAGEUP) scrollOffset-=180;
-                if(action==SB_PAGEDOWN) scrollOffset+=180;
-                if(action==SB_THUMBTRACK||action==SB_THUMBPOSITION) scrollOffset=scroll.nTrackPos;
-                scrollOffset=std::clamp(scrollOffset,0,scrollLimit);layout();return 0;
+                int next=scrollOffset;
+                if(action==SB_LINEUP) next-=32;
+                if(action==SB_LINEDOWN) next+=32;
+                if(action==SB_PAGEUP) next-=180;
+                if(action==SB_PAGEDOWN) next+=180;
+                if(action==SB_TOP) next=0;
+                if(action==SB_BOTTOM) next=scrollLimit;
+                if(action==SB_THUMBTRACK||action==SB_THUMBPOSITION) next=scroll.nTrackPos;
+                scrollTo(next);return 0;
             }
             case WM_MOUSEWHEEL:
-                scrollOffset=std::clamp(scrollOffset-GET_WHEEL_DELTA_WPARAM(w)*45/WHEEL_DELTA,0,scrollLimit);
-                layout();return 0;
-            case WM_SIZE:layout();return 0;
+                if(hwnd==window&&!dropdownOpen()) {
+                    const POINT point{GET_X_LPARAM(l),GET_Y_LPARAM(l)};
+                    const HWND hovered=WindowFromPoint(point);
+                    if(hovered&&hovered!=viewport&&hovered!=content&&IsChild(window,hovered)) {
+                        return SendMessageW(hovered,msg,w,l);
+                    }
+                }
+                scrollTo(scrollOffset-MulDiv(GET_WHEEL_DELTA_WPARAM(w),45,WHEEL_DELTA));return 0;
+            case WM_SIZE:if(hwnd==window) layout();return 0;
+            case WM_KEYDOWN:if(w==VK_ESCAPE) {close();return 0;}break;
             case finished:finishJob();return 0;
             case WM_COMMAND:command(LOWORD(w),HIWORD(w));return 0;
-            case WM_ERASEBKGND:return 1;
+            case WM_ERASEBKGND: {
+                RECT client{};GetClientRect(hwnd,&client);fill(reinterpret_cast<HDC>(w),client,bg);return 1;
+            }
             case WM_PAINT: {
                 PAINTSTRUCT paint{};HDC dc=BeginPaint(hwnd,&paint);fill(dc,paint.rcPaint,bg);EndPaint(hwnd,&paint);return 0;
             }
@@ -812,20 +1047,89 @@ struct RenameStudio::Impl {
                 SetTextColor(dc,fg);SetBkColor(dc,msg==WM_CTLCOLORSTATIC?bg:inputColor);
                 return reinterpret_cast<LRESULT>(msg==WM_CTLCOLORSTATIC?brush:editBrush);
             }
+            case WM_MEASUREITEM: {
+                auto& measure=*reinterpret_cast<MEASUREITEMSTRUCT*>(l);
+                if(measure.CtlType==ODT_LISTBOX&&measure.CtlID==blocks) {measure.itemHeight=dp(32);return TRUE;}
+                if(measure.CtlType==ODT_COMBOBOX) {measure.itemHeight=dp(26);return TRUE;}
+                break;
+            }
             case WM_DRAWITEM: {
                 auto& draw=*reinterpret_cast<DRAWITEMSTRUCT*>(l);
+                if(draw.CtlID==liveExample) {
+                    fill(draw.hDC,draw.rcItem,bg);
+                    const auto old=SelectObject(draw.hDC,font?font:GetStockObject(DEFAULT_GUI_FONT));
+                    SetBkMode(draw.hDC,TRANSPARENT);SetTextColor(draw.hDC,fg);
+                    const auto value=text(draw.hwndItem);
+                    RECT bounds=draw.rcItem;
+                    DrawTextW(draw.hDC,value.c_str(),static_cast<int>(value.size()),&bounds,
+                        DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
+                    SelectObject(draw.hDC,old);return TRUE;
+                }
+                if(draw.CtlType==ODT_COMBOBOX) {
+                    const bool selected=(draw.itemState&ODS_SELECTED)!=0;
+                    fill(draw.hDC,draw.rcItem,selected?RGB(54,46,86):inputColor);
+                    const auto index=draw.itemID==static_cast<UINT>(-1)
+                        ?SendMessageW(draw.hwndItem,CB_GETCURSEL,0,0):static_cast<LRESULT>(draw.itemID);
+                    const auto count=SendMessageW(draw.hwndItem,CB_GETCOUNT,0,0);
+                    std::wstring value;
+                    if(index>=0&&index<count) {
+                        const auto length=SendMessageW(draw.hwndItem,CB_GETLBTEXTLEN,static_cast<WPARAM>(index),0);
+                        if(length>=0&&length<=32768) {
+                            value.resize(static_cast<std::size_t>(length)+1,L'\0');
+                            const auto copied=SendMessageW(draw.hwndItem,CB_GETLBTEXT,static_cast<WPARAM>(index),reinterpret_cast<LPARAM>(value.data()));
+                            value.resize(copied>=0?static_cast<std::size_t>(copied):0);
+                        }
+                    }
+                    const auto old=SelectObject(draw.hDC,font?font:GetStockObject(DEFAULT_GUI_FONT));
+                    SetBkMode(draw.hDC,TRANSPARENT);
+                    SetTextColor(draw.hDC,(draw.itemState&ODS_DISABLED)?muted:selected?accent:fg);
+                    RECT bounds=draw.rcItem;bounds.left+=dp(7);bounds.right-=dp(7);
+                    DrawTextW(draw.hDC,value.c_str(),static_cast<int>(value.size()),&bounds,
+                        DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
+                    SelectObject(draw.hDC,old);return TRUE;
+                }
+                if(draw.CtlType==ODT_LISTBOX&&draw.CtlID==blocks) {
+                    const bool selected=(draw.itemState&ODS_SELECTED)!=0;
+                    fill(draw.hDC,draw.rcItem,selected?RGB(54,46,86):inputColor);
+                    if(draw.itemID==static_cast<UINT>(-1)) return TRUE;
+                    const int count=static_cast<int>(SendMessageW(draw.hwndItem,LB_GETTEXTLEN,draw.itemID,0));
+                    if(count<0) return TRUE;
+                    std::wstring value(static_cast<std::size_t>(count)+1,L'\0');
+                    SendMessageW(draw.hwndItem,LB_GETTEXT,draw.itemID,reinterpret_cast<LPARAM>(value.data()));
+                    const auto old=SelectObject(draw.hDC,font);
+                    SetBkMode(draw.hDC,TRANSPARENT);SetTextColor(draw.hDC,selected?accent:fg);
+                    RECT bounds=draw.rcItem;bounds.left+=dp(10);bounds.right-=dp(10);
+                    DrawTextW(draw.hDC,value.c_str(),count,&bounds,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
+                    SelectObject(draw.hDC,old);return TRUE;
+                }
                 const bool active=(draw.CtlID==static_cast<UINT>(tabAssign+tab));
                 fill(draw.hDC,draw.rcItem,active?RGB(42,37,69):inputColor);
                 const auto old=SelectObject(draw.hDC,font);
                 SetBkMode(draw.hDC,TRANSPARENT);
                 SetTextColor(draw.hDC,(draw.itemState&ODS_DISABLED)?muted:active?accent:fg);
                 auto value=text(draw.hwndItem);
-                DrawTextW(draw.hDC,value.c_str(),static_cast<int>(value.size()),&draw.rcItem,
+                RECT bounds=draw.rcItem;bounds.left+=dp(5);bounds.right-=dp(5);
+                DrawTextW(draw.hDC,value.c_str(),static_cast<int>(value.size()),&bounds,
                           DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
                 SelectObject(draw.hDC,old);return TRUE;
             }
             case WM_NOTIFY: {
                 const auto* header=reinterpret_cast<const NMHDR*>(l);
+                if(header->code==TTN_GETDISPINFOW) {
+                    auto& info=*reinterpret_cast<NMTTDISPINFOW*>(l);
+                    const HWND control=reinterpret_cast<HWND>(header->idFrom);
+                    if(control==c(blockUp)) tooltipText=L"Переместить часть выше · Ctrl+↑";
+                    else if(control==c(blockDown)) tooltipText=L"Переместить часть ниже · Ctrl+↓";
+                    else if(control==c(closePanel)) tooltipText=L"Закрыть панель · Esc";
+                    else if(control==c(blocks)) {
+                        POINT point{};GetCursorPos(&point);ScreenToClient(control,&point);
+                        const auto hit=SendMessageW(control,LB_ITEMFROMPOINT,0,MAKELPARAM(point.x,point.y));
+                        const auto count=HIWORD(hit)==0?SendMessageW(control,LB_GETTEXTLEN,LOWORD(hit),0):LB_ERR;
+                        tooltipText.clear();
+                        if(count>=0) {tooltipText.resize(static_cast<std::size_t>(count)+1);SendMessageW(control,LB_GETTEXT,LOWORD(hit),reinterpret_cast<LPARAM>(tooltipText.data()));}
+                    } else tooltipText=text(control);
+                    info.lpszText=tooltipText.data();return 0;
+                }
                 if(header->idFrom==previewList&&header->code==LVN_ITEMCHANGED&&!filling) {
                     const auto& event=*reinterpret_cast<const NMLISTVIEW*>(l);
                     if(event.iItem>=0&&event.iItem<static_cast<int>(shown.size())) {
@@ -865,6 +1169,11 @@ void RenameStudio::show(RECT bounds,UINT dpi,HFONT font) {
     impl_->dpi=dpi;impl_->font=font;
     for(const auto& [id,control]:impl_->controls) {
         (void)id;SendMessageW(control,WM_SETFONT,reinterpret_cast<WPARAM>(font),FALSE);
+    }
+    SendMessageW(impl_->c(blocks),LB_SETITEMHEIGHT,0,impl_->dp(32));
+    for(int id:{assignment,blockKind,blockCase,counterScope}) {
+        SendMessageW(impl_->c(id),CB_SETITEMHEIGHT,static_cast<WPARAM>(-1),impl_->dp(22));
+        SendMessageW(impl_->c(id),CB_SETITEMHEIGHT,0,impl_->dp(26));
     }
     SetWindowPos(impl_->window,HWND_TOP,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,
                  SWP_NOACTIVATE|SWP_SHOWWINDOW);
