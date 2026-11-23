@@ -1,0 +1,44 @@
+name: Windows x64 build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Configure and build
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DVIEWERY_MEDIA_TESTS=ON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release --parallel
+      - name: Download pinned runtime tools
+        shell: pwsh
+        run: ./scripts/Get-MediaTools.ps1 -Destination build/bin/Release
+      - name: Test real photo, VFR GIF, VFR video and GIF export
+        shell: pwsh
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Build Explorer package for signing
+        shell: pwsh
+        run: ./scripts/Build-ExplorerPackage.ps1 -Destination ./build/bin/Release
+      - name: Assemble portable application files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item -LiteralPath build/bin/Release/Viewery.exe,build/bin/Release/VieweryShell.dll,build/bin/Release/Viewery.Explorer.msix,README.md,THIRD_PARTY.md,scripts/Get-MediaTools.ps1,scripts/Set-ExplorerIntegration.ps1 -Destination dist
+          Copy-Item -Path 'build/bin/Release/VieweryLogo*.png' -Destination dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Viewery-Windows-x64
+          if-no-files-found: error
+          path: dist/
