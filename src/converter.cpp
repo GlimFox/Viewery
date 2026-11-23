@@ -1,4 +1,5 @@
 #include "converter.hpp"
+#include "runtime_paths.hpp"
 
 #include <windows.h>
 
@@ -100,12 +101,7 @@ struct ConversionFiles {
 };
 
 fs::path ffmpegPath() {
-    std::wstring executable(32768, L'\0');
-    const auto capacity = static_cast<DWORD>(executable.size());
-    const DWORD length = GetModuleFileNameW(nullptr, executable.data(), capacity);
-    if (length == 0 || length >= capacity) return {};
-    executable.resize(length);
-    return fs::path(executable).parent_path() / L"ffmpeg.exe";
+    return runtime::mediaToolPath(L"ffmpeg.exe");
 }
 
 // FFmpeg reads the original UTF-16 command line with CommandLineToArgvW.
@@ -241,7 +237,7 @@ ConversionResult convertToGif(const fs::path& input, const fs::path& output, Gif
         if (fs::exists(target)) return {false, L"An output file already exists at that path."};
         const auto ffmpeg = ffmpegPath();
         if (ffmpeg.empty() || !fs::is_regular_file(ffmpeg)) {
-            return {false, L"Place ffmpeg.exe next to Viewery.exe to enable GIF conversion."};
+            return {false, L"Установите медиакомпоненты через меню Viewery для экспорта GIF."};
         }
 
         // Both passes must read the same source. Allow other readers including the player.

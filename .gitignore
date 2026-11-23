@@ -4,3 +4,11 @@
 /.vs/
 /CMakeUserPresets.json
 *.user
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.pfx
+*.p12
+.env
+.env.*

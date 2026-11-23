@@ -39,7 +39,17 @@ function Install-MediaArchive {
         $candidates[0].FullName
     }
     foreach ($source in $sources) {
-        Copy-Item -LiteralPath $source -Destination $Destination -Force
+        $target = Join-Path $Destination ([IO.Path]::GetFileName($source))
+        $staged = Join-Path $Destination ('.viewery-' + [guid]::NewGuid().ToString('N') + '.tmp')
+        try {
+            # Complete the verified file on the destination volume before publishing its usable name.
+            # Cancellation during copying cannot leave a partial libmpv/FFmpeg at the runtime path.
+            [IO.File]::Copy($source,$staged,$false)
+            if ([IO.File]::Exists($target)) { [IO.File]::Replace($staged,$target,[NullString]::Value) }
+            else { [IO.File]::Move($staged,$target) }
+        } finally {
+            if ([IO.File]::Exists($staged)) { [IO.File]::Delete($staged) }
+        }
     }
 }
 

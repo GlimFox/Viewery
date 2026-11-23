@@ -1,4 +1,5 @@
 #include "media.hpp"
+#include "runtime_paths.hpp"
 
 #include <windowsx.h>
 
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <string_view>
 #include <utility>
@@ -56,14 +58,6 @@ struct Event { EventId id; int error; std::uint64_t replyId; void* data; };
 static_assert(sizeof(void*) == 8);
 static_assert(sizeof(Event) == 24 && sizeof(Node) == 16 && sizeof(Property) == 24);
 
-std::filesystem::path executableDirectory() {
-    std::wstring path(32768, L'\0');
-    const DWORD size = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-    if (size == 0 || size >= path.size()) return {};
-    path.resize(size);
-    return std::filesystem::path(path).parent_path();
-}
-
 std::wstring fromUtf8(std::string_view text) {
     if (text.empty() || text.size() > INT_MAX) return {};
     const int size = static_cast<int>(text.size());
@@ -96,11 +90,11 @@ struct MpvApi {
     std::wstring error;
 
     MpvApi() {
-        const auto directory = executableDirectory();
-        error = L"Place libmpv 0.40 or later (x64, libmpv-2.dll or mpv-2.dll) next to Viewery.exe.";
-        if (directory.empty()) return;
+        error = L"Установите медиакомпоненты через меню Viewery, чтобы открыть этот файл.";
         for (const auto* name : {L"libmpv-2.dll", L"mpv-2.dll"}) {
-            const HMODULE library = LoadLibraryExW((directory / name).c_str(), nullptr,
+            const auto path = runtime::mediaToolPath(name);
+            if (path.empty()) continue;
+            const HMODULE library = LoadLibraryExW(path.c_str(), nullptr,
                 LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
             if (!library) continue;
 
@@ -414,9 +408,15 @@ bool MediaPlayer::initialize(HWND videoHost) {
         error_ = L"The media host must belong to the player thread.";
         return false;
     }
-    static const MpvApi api;
+    static std::mutex functionsMutex;
+    std::unique_lock functionsLock(functionsMutex);
+    static std::unique_ptr<MpvApi> functions;
+    if (!functions || !functions->error.empty()) functions = std::make_unique<MpvApi>();
+    const MpvApi& api = *functions;
     error_ = api.error;
     if (!error_.empty()) return false;
+    // Once a valid API is loaded it is retained for the process lifetime.
+    functionsLock.unlock();
 
     MpvHandle* handle = api.create();
     if (!handle) {
