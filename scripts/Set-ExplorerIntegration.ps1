@@ -46,6 +46,18 @@ function Get-VieweryPackage {
 }
 
 function Register-ModernMenu([System.IO.FileInfo] $file) {
+    # A complete MSIX already owns the modern command. Never replace it with a sparse package.
+    foreach ($installed in Get-VieweryPackage) {
+        if ($installed.InstallLocation -and
+            (Test-Path -LiteralPath (Join-Path $installed.InstallLocation 'Viewery.exe') -PathType Leaf)) {
+            if ($installed.InstallLocation.Equals($file.DirectoryName,[StringComparison]::OrdinalIgnoreCase)) {
+                $script:fullPackage = $true
+                return $true
+            }
+            Write-Warning 'The installed full Viewery application owns the modern menu. A portable installation will use the classic menu.'
+            return $false
+        }
+    }
     $package = Join-Path $file.DirectoryName 'Viewery.Explorer.msix'
     $dll = Join-Path $file.DirectoryName 'VieweryShell.dll'
     if ($file.Name -ne 'Viewery.exe' -or
@@ -88,6 +100,7 @@ function Register-ModernMenu([System.IO.FileInfo] $file) {
 }
 
 $modern = $false
+$fullPackage = $false
 if ($Action -eq 'Install' -and -not $ClassicOnly) {
     $modern = Register-ModernMenu $file
 }
@@ -116,7 +129,21 @@ foreach ($extension in $extensions) {
 if ($Action -eq 'Install') {
     if ($StartAtLogon) {
         $run = $hive.CreateSubKey($runPath)
-        try { $run.SetValue('Viewery', "$application --background", $stringType) }
+        try {
+            $startupApplication = $application
+            if (-not $fullPackage) {
+                $fullPackage = @(Get-VieweryPackage | Where-Object {
+                    $_.InstallLocation -and $_.InstallLocation.Equals($file.DirectoryName,[StringComparison]::OrdinalIgnoreCase) -and
+                    (Test-Path -LiteralPath (Join-Path $_.InstallLocation 'Viewery.exe') -PathType Leaf)
+                }).Count -gt 0
+            }
+            if ($fullPackage) {
+                # AppExecutionAlias survives changes to the MSIX installation directory.
+                $alias = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Microsoft\WindowsApps\Viewery.exe'
+                $startupApplication = '"{0}"' -f $alias
+            }
+            $run.SetValue('Viewery', "$startupApplication --background", $stringType)
+        }
         finally { $run.Dispose() }
     }
     if ($modern) { Write-Host 'Viewery registered in the Windows 11 context menu.' }
@@ -132,7 +159,11 @@ if ($Action -eq 'Install') {
         } finally { $run.Dispose() }
     }
     foreach ($item in Get-VieweryPackage) {
-        Remove-AppxPackage -Package $item.PackageFullName -ErrorAction Stop
+        if (Test-Path -LiteralPath (Join-Path $item.InstallLocation 'Viewery.exe') -PathType Leaf) {
+            Write-Warning 'The modern command belongs to the installed full Viewery application. Remove the app in Windows Settings to remove that command.'
+        } else {
+            Remove-AppxPackage -Package $item.PackageFullName -ErrorAction Stop
+        }
     }
     $settings = $hive.OpenSubKey($settingsPath, $true)
     if ($settings) {

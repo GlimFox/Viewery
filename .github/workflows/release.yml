@@ -1,0 +1,139 @@
+name: Release Windows x64
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Existing version tag, e.g. v0.2.0-beta.1'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: viewery-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate immutable release tag
+        id: version
+        shell: pwsh
+        env:
+          REQUESTED_TAG: ${{ inputs.version }}
+        run: |
+          $tag = if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') { $env:REQUESTED_TAG } else { $env:GITHUB_REF_NAME }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(-beta\.[1-9]\d*)?$') { throw 'Invalid release tag.' }
+          git show-ref --verify "refs/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw 'Create and push the version tag before releasing.' }
+          git checkout --detach $tag
+          if ($LASTEXITCODE -ne 0) { throw 'Tag checkout failed.' }
+          $version = $tag.Substring(1)
+          $channel = if ($version.Contains('-beta.')) { 'beta' } else { 'stable' }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "number=$version" >> $env:GITHUB_OUTPUT
+          "channel=$channel" >> $env:GITHUB_OUTPUT
+      - name: Build all targets
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.number }}
+        run: |
+          cmake -S . -B build -G 'Visual Studio 17 2022' -A x64 -T v143 -DCMAKE_SYSTEM_VERSION=10.0.26100.0 -DVIEWERY_MEDIA_TESTS=ON "-DVIEWERY_VERSION=$env:RELEASE_VERSION"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Download pinned tools for tests only
+        shell: pwsh
+        run: ./scripts/Get-MediaTools.ps1 -Destination build/bin/Release -IncludeProbe
+      - name: Run tests
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package and optionally sign
+        id: package
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.number }}
+          RELEASE_CHANNEL: ${{ steps.version.outputs.channel }}
+          SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+        run: |
+          $certificate = $null
+          $pfx = Join-Path $env:RUNNER_TEMP ('viewery-signing-' + [guid]::NewGuid() + '.pfx')
+          try {
+            $parameters = @{
+              BuildDirectory = 'build/bin/Release'
+              Destination = 'dist'
+              Version = $env:RELEASE_VERSION
+              Channel = $env:RELEASE_CHANNEL
+            }
+            if ($env:SIGNING_PFX_BASE64) {
+              [IO.File]::WriteAllBytes($pfx,[Convert]::FromBase64String($env:SIGNING_PFX_BASE64))
+              $password = ConvertTo-SecureString $env:SIGNING_PFX_PASSWORD -AsPlainText -Force
+              # This imports only the private signing key on the ephemeral runner, never a trusted root.
+              $certificate = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
+              $parameters.SigningThumbprint = $certificate.Thumbprint
+            }
+            ./scripts/Build-Release.ps1 @parameters
+            $signed = if ($certificate) { 'true' } else { 'false' }
+            "signed=$signed" >> $env:GITHUB_OUTPUT
+          } finally {
+            if ($certificate) { Remove-Item -LiteralPath $certificate.PSPath -Force }
+            if (Test-Path -LiteralPath $pfx) { Remove-Item -LiteralPath $pfx -Force }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Viewery-${{ steps.version.outputs.number }}-packaging-validation
+          path: dist/
+          if-no-files-found: error
+      - name: Publish immutable version release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.version.outputs.number }}
+          RELEASE_CHANNEL: ${{ steps.version.outputs.channel }}
+          HAS_SIGNATURE: ${{ steps.package.outputs.signed }}
+        run: |
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) { throw 'Release already exists; immutable version assets will not be overwritten.' }
+          New-Item -ItemType Directory -Path publish | Out-Null
+          Copy-Item -LiteralPath "dist/Viewery-$env:RELEASE_VERSION-Windows-x64-portable.zip" -Destination publish
+          if ($env:HAS_SIGNATURE -eq 'true') {
+            Copy-Item -LiteralPath "dist/Viewery-$env:RELEASE_VERSION-x64.msix",'dist/Viewery.appinstaller' -Destination publish
+          }
+          Get-ChildItem -LiteralPath publish -File | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(),$_.Name
+          } | Set-Content -LiteralPath publish/SHA256SUMS.txt -Encoding ascii
+          $parameters = @('release','create',$env:RELEASE_TAG,'--verify-tag','--repo',$env:GITHUB_REPOSITORY,'--title',"Viewery $env:RELEASE_VERSION",'--notes-file',"dist/Viewery-$env:RELEASE_VERSION-ReleaseNotes.md")
+          if ($env:RELEASE_CHANNEL -eq 'beta') { $parameters += '--prerelease' }
+          $parameters += @(Get-ChildItem -LiteralPath publish -File | ForEach-Object FullName)
+          gh @parameters
+          if ($LASTEXITCODE -ne 0) { throw 'Release publishing failed.' }
+      - name: Publish signed App Installer channel
+        if: steps.package.outputs.signed == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CHANNEL: ${{ steps.version.outputs.channel }}
+        run: |
+          $channelTag = "updates-$env:RELEASE_CHANNEL"
+          gh release view $channelTag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $channelTag --repo $env:GITHUB_REPOSITORY --prerelease --title "Viewery $env:RELEASE_CHANNEL update feed" --notes 'Signed App Installer channel. Download application versions from the corresponding v* releases.' --target $env:GITHUB_SHA
+            if ($LASTEXITCODE -ne 0) { throw 'Channel creation failed.' }
+          }
+          gh release upload $channelTag dist/Viewery.appinstaller --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Channel feed publishing failed.' }
