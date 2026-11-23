@@ -94,4 +94,3 @@ if(BUILD_TESTING AND VIEWERY_GUI_TESTS)
         "${CMAKE_BINARY_DIR}/studio-gui-test-data")
     set_tests_properties(rename-studio-gui PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 endif()
-
