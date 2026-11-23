@@ -10,6 +10,7 @@
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <shobjidl.h>
 #include <windowsx.h>
 #include <wrl/client.h>
@@ -87,7 +88,7 @@ constexpr std::array buttonLabels{
     L"Сбалансированный", L"Расширенные настройки", L"Экспортировать",
     L"Стоп-кадр: ЛКМ — копировать, ПКМ — сохранить PNG",
     L"Переключить время и кадры", L"Вставить позицию таймлайна в выбранное поле",
-    L"Переименование и коллекция"
+    L"Переименовать"
 };
 
 enum Menu : UINT {
@@ -99,13 +100,17 @@ enum Menu : UINT {
     moduleRename, updatesCheck, updatesAutomatic, updatesInstall, updatesNotes, mediaToolsInstall,
     groupNone, groupArtist, groupWork, groupFormat, groupDirectory,
     sortArtist, sortNumber, sortTitle, sortVersion, sortCustom, filterUnassigned, filterUntitled, filterUnorganized,
-    libraryRefresh, groupKeysForward, groupKeysReverse
+    libraryRefresh, groupKeysForward, groupKeysReverse, libraryOpenStudio
 };
 
 constexpr UINT rangeStartId = 600;
 constexpr UINT rangeEndId = 601;
 constexpr UINT volumeTrackId = 602;
 constexpr UINT catalogSearchId = 603;
+
+enum FileMenu : UINT {
+    filePreview=1100,fileReveal,fileCopyPath,fileCopyName,fileCopy,fileProperties,fileSelect,fileRename
+};
 
 std::wstring_view iconFor(Control control, bool paused, bool fullscreen, bool bottom)
 {
@@ -207,6 +212,27 @@ void copyText(HWND window, const std::wstring& value)
         }
     }
     if (memory) GlobalFree(memory);
+}
+
+bool copyFile(HWND window,const fs::path& file)
+{
+    const auto value=file.wstring();
+    const auto bytes=sizeof(DROPFILES)+(value.size()+2)*sizeof(wchar_t);
+    HGLOBAL memory=GlobalAlloc(GMEM_MOVEABLE|GMEM_ZEROINIT,bytes);
+    if(!memory) return false;
+    bool copied=false;
+    if(auto* drop=static_cast<DROPFILES*>(GlobalLock(memory))) {
+        drop->pFiles=sizeof(DROPFILES);drop->fWide=TRUE;
+        std::copy_n(value.c_str(),value.size()+1,reinterpret_cast<wchar_t*>(drop+1));
+        GlobalUnlock(memory);
+        if(OpenClipboard(window)) {
+            EmptyClipboard();
+            if(SetClipboardData(CF_HDROP,memory)) {memory=nullptr;copied=true;}
+            CloseClipboard();
+        }
+    }
+    if(memory) GlobalFree(memory);
+    return copied;
 }
 
 std::optional<fs::path> dialogPath(HWND owner, bool folder, const fs::path* target = nullptr, bool png = false)
@@ -334,6 +360,9 @@ private:
     bool groupedCatalog() const;
     int catalogHeaderHeight() const {return dp(studio_&&renameEnabled_?62:31);}
     void selectCatalog(int index,UINT keys,bool checkbox);
+    int catalogItemAt(POINT point) const;
+    RECT checkboxRect(RECT item) const;
+    void closeStudio();
     void acceptUpdate();
     void navigateGroup(int direction);
     void updateCounter();
@@ -344,6 +373,9 @@ private:
     void command(UINT id);
     void openMenu(POINT point, bool tray);
     void catalogMenu(POINT point);
+    HMENU makeFileMenu(const fs::path& file) const;
+    void fileMenu(POINT point,const fs::path& file);
+    void fileCommand(UINT command,const fs::path& file);
     void speedMenu(POINT point);
     void presetMenu(POINT point);
     void changeShortcut(PreviewHotkey shortcut);
@@ -353,6 +385,7 @@ private:
     bool receiveOpen(const COPYDATASTRUCT& data);
 
     std::wstring fileInfo() const;
+    std::wstring statusSummary() const;
     std::optional<double> readRange(HWND field) const;
     void setRangeValue(HWND field, double seconds);
     void useTimelinePosition();
@@ -619,7 +652,7 @@ bool App::makeViewer()
     catalogSearch_=CreateWindowExW(0,L"EDIT",L"",WS_CHILD|WS_TABSTOP|ES_AUTOHSCROLL,
                                   0,0,0,0,window_,reinterpret_cast<HMENU>(static_cast<UINT_PTR>(catalogSearchId)),
                                   instance_,nullptr);
-    SendMessageW(catalogSearch_,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(L"Поиск · художник, работа, файл"));
+    SendMessageW(catalogSearch_,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(L"Поиск"));
     editBrush_ = CreateSolidBrush(raised);
     tooltip_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
                                0, 0, 0, 0, window_, nullptr, instance_, nullptr);
@@ -760,6 +793,7 @@ void App::openMedia(const fs::path& file)
     setRangeValue(rangeStart_, 0);
     setRangeValue(rangeEnd_, -1);
     kind_ = kind;
+    if(!samePath(path_,file)) resumePlayback_.reset();
     path_ = file;
     hasFileMetadata_ = GetFileAttributesExW(file.c_str(), GetFileExInfoStandard, &fileMetadata_) != FALSE;
     playback_ = {};
@@ -994,6 +1028,7 @@ void App::layout()
         place(id, x, y, dp(width), dp(32), enabled);
     };
     const bool fullUi = mode_ == Mode::full && !fullscreen_;
+    const bool showStudio=fullUi&&detail_==Detail::renameStudio;
     const bool quickUi = mode_ == Mode::quick;
     const bool moving = kind_ && kind_ != MediaKind::image;
     const bool playbackBar = moving || (quickUi && kind_);
@@ -1007,7 +1042,7 @@ void App::layout()
         button(Control::open, dp(8), dp(4), 33);
         button(Control::catalog, dp(46), dp(4), 33);
         button(Control::panelPosition, dp(84), dp(4), 33);
-        if(renameEnabled_) button(Control::renameStudio,dp(127),dp(4),142);
+        if(renameEnabled_) button(Control::renameStudio,dp(127),dp(4),132);
         button(Control::info, client_.right - dp(116), dp(4), 33, kind_.has_value());
         button(Control::exportGif, client_.right - dp(78), dp(4), 33,
                kind_ == MediaKind::video || exportThread_.joinable());
@@ -1024,7 +1059,10 @@ void App::layout()
 
     if (fullUi && panel_ == Panel::left) {
         catalogRect_ = mediaRect_;
-        catalogRect_.right = dp(std::clamp(catalogWidth_, 172, std::max(172, spanX(client_) * 96 / static_cast<int>(dpi_) - 375)));
+        const int minimum=showStudio?148:172;
+        const int remaining=showStudio?500:375;
+        catalogRect_.right = dp(std::clamp(catalogWidth_,minimum,
+            std::max(minimum,spanX(client_)*96/static_cast<int>(dpi_)-remaining)));
         mediaRect_.left = catalogRect_.right + dp(4);
         divider_ = {catalogRect_.right, catalogRect_.top, mediaRect_.left, catalogRect_.bottom};
     }
@@ -1035,11 +1073,6 @@ void App::layout()
         divider_ = {0, catalogRect_.top - dp(4), client_.right, catalogRect_.top};
         mediaRect_.bottom = divider_.top;
     }
-    const bool searchVisible=fullUi&&studio_&&renameEnabled_&&panel_!=Panel::hidden;
-    if(searchVisible) {
-        SetWindowPos(catalogSearch_,HWND_TOP,catalogRect_.left+dp(8),catalogRect_.top+dp(31),
-                     std::max(dp(60),spanX(catalogRect_)-dp(16)),dp(25),SWP_NOACTIVATE|SWP_SHOWWINDOW);
-    } else ShowWindow(catalogSearch_,SW_HIDE);
     const bool showDetails = fullUi && detail_ != Detail::none;
     if (showDetails) {
         detailsRect_ = contentRect;
@@ -1067,6 +1100,12 @@ void App::layout()
             }
         }
     }
+    const bool searchVisible=fullUi&&studio_&&renameEnabled_&&panel_!=Panel::hidden;
+    if(searchVisible) {
+        SetWindowPos(catalogSearch_,HWND_TOP,catalogRect_.left+dp(8),catalogRect_.top+dp(31),
+                     std::max(dp(60),spanX(catalogRect_)-dp(16)),dp(25),SWP_NOACTIVATE|SWP_SHOWWINDOW);
+        SendMessageW(catalogSearch_,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,MAKELPARAM(dp(5),dp(5)));
+    } else ShowWindow(catalogSearch_,SW_HIDE);
     if(studio_&&(!showDetails||detail_!=Detail::renameStudio)) studio_->hide();
     const bool rangeVisible = showDetails && detail_ == Detail::exportGif;
     if (rangeVisible) {
@@ -1138,7 +1177,16 @@ void App::layout()
     } else if (playbackBar && quickUi) {
         filenameRect_ = {dp(11), playbackRect_.top, playbackRect_.right - dp(11), playbackRect_.bottom};
     } else if (fullUi && kind_ == MediaKind::image) {
-        filenameRect_ = {dp(150), statusRect_.top + 1, statusRect_.right - dp(106), statusRect_.bottom};
+        int summaryWidth=dp(190);
+        if(HDC dc=GetDC(window_)) {
+            const auto oldFont=SelectObject(dc,font_);
+            const auto summary=statusSummary();SIZE size{};
+            GetTextExtentPoint32W(dc,summary.c_str(),static_cast<int>(summary.size()),&size);
+            summaryWidth=std::clamp(static_cast<int>(size.cx)+dp(32),dp(190),dp(320));
+            SelectObject(dc,oldFont);ReleaseDC(window_,dc);
+        }
+        filenameRect_ = {std::min(summaryWidth,static_cast<int>(statusRect_.right)-dp(280)),
+            statusRect_.top + 1,statusRect_.right - dp(106),statusRect_.bottom};
     }
     if (!IsRectEmpty(&filenameRect_) && !path_.empty()) {
         HDC dc = GetDC(window_);
@@ -1311,16 +1359,27 @@ void App::paintCatalog(HDC dc)
             }
             label(dc, file.name, {rect.left + dp(7), rect.bottom - dp(23), rect.right - dp(4), rect.bottom});
         } else {
-            label(dc, file.name, {rect.left + dp(8), rect.top, rect.right - dp(5), rect.bottom});
+            const int inset=renameEnabled_&&(selectMode_||selectedFile)?30:8;
+            label(dc,file.name,{rect.left+dp(inset),rect.top,rect.right-dp(5),rect.bottom});
         }
         if(renameEnabled_&&(selectMode_||selectedFile)) {
-            RECT check{rect.left+dp(5),rect.top+dp(4),rect.left+dp(22),rect.top+dp(21)};
+            RECT check=checkboxRect(rect);
             rounded(dc,check,selectedFile?accent:surface,selectedFile?accent:hint,dp(4));
             if(selectedFile) label(dc,L"✓",check,background,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         }
     }
     DeleteDC(memory);
     RestoreDC(dc, saved);
+}
+
+std::wstring App::statusSummary() const
+{
+    if(!status_.empty()) return status_;
+    if(!playback_.width||!playback_.height) return {};
+    auto value=std::to_wstring(playback_.width)+L" × "+std::to_wstring(playback_.height);
+    if(!playback_.videoCodec.empty()) value+=L"   ·   "+playback_.videoCodec;
+    if(playback_.fps>0&&kind_!=MediaKind::image) value+=L"   ·   "+decimal(playback_.fps,1)+L" FPS";
+    return value;
 }
 
 std::wstring App::fileInfo() const
@@ -1490,13 +1549,7 @@ void App::paint()
     }
     if (!IsRectEmpty(&statusRect_)) {
         fill(dc, {0, statusRect_.top, statusRect_.right, statusRect_.top + 1}, border);
-        std::wstring summary;
-        if (playback_.width && playback_.height) {
-            summary = std::to_wstring(playback_.width) + L" × " + std::to_wstring(playback_.height);
-            if (!playback_.videoCodec.empty()) summary += L"   ·   " + playback_.videoCodec;
-            if (playback_.fps > 0 && kind_ != MediaKind::image) summary += L"   ·   " + decimal(playback_.fps, 1) + L" FPS";
-        }
-        if (!status_.empty()) summary = status_;
+        const auto summary=statusSummary();
         const auto summaryRight = IsRectEmpty(&playbackRect_) && !IsRectEmpty(&filenameRect_)
             ? filenameRect_.left - dp(8) : statusRect_.right - dp(100);
         label(dc, summary, {dp(15), statusRect_.top, summaryRight, statusRect_.bottom}, hint);
@@ -1559,7 +1612,7 @@ void App::refresh()
             }
             if (speedChanged) set(Control::speed, decimal(playback_.speed, 2) + L"×");
         }
-        if (failChanged || readyChanged) layout();
+        if(failChanged||readyChanged||(infoChanged&&kind_==MediaKind::image)) layout();
         if (timeChanged && !IsRectEmpty(&timeline_)) {
             InvalidateRect(controlsStrip_, nullptr, FALSE);
         }
@@ -1725,6 +1778,7 @@ void App::click(POINT point, UINT buttons)
             catalogMenu(point);
             return;
         }
+        if(point.y<catalogRect_.top+catalogHeaderHeight()) return;
         if(groupedCatalog()) {
             for(const auto& [bounds,entry]:collectionHeaders_) {
                 auto rect=bounds;
@@ -1734,26 +1788,13 @@ void App::click(POINT point, UINT buttons)
                     rebuildCollectionView();layout();return;
                 }
             }
-            for(std::size_t index=0;index<files_.size();++index) {
-                const auto rect=itemRect(index);
-                if(PtInRect(&rect,point)) {
-                    const bool checkbox=selectMode_&&point.x<rect.left+dp(26)&&point.y<rect.top+dp(26);
-                    selectCatalog(static_cast<int>(index),buttons,checkbox);return;
-                }
-            }
-            return;
         }
-        const bool bottom = panel_ == Panel::bottom;
-        const int index = bottom
-            ? (point.x - catalogRect_.left - dp(10) + scroll_) / strideX()
-            : ((point.y - catalogRect_.top - catalogHeaderHeight() + scroll_) / strideY()) * columns() +
-              (point.x - catalogRect_.left - dp(10)) / strideX();
-        if (index >= 0 && index < static_cast<int>(files_.size())) {
-            const RECT bounds = itemRect(static_cast<std::size_t>(index));
-            if (PtInRect(&bounds, point)) {
-                const bool checkbox=selectMode_&&point.x<bounds.left+dp(26)&&point.y<bounds.top+dp(26);
-                selectCatalog(index,buttons,checkbox);
-            }
+        if(const int index=catalogItemAt(point);index>=0) {
+            const auto& file=files_[static_cast<std::size_t>(index)];
+            RECT check=checkboxRect(itemRect(static_cast<std::size_t>(index)));
+            InflateRect(&check,dp(4),dp(4));
+            const bool checkbox=renameEnabled_&&(selectMode_||selectedFiles_.contains(file.path))&&PtInRect(&check,point);
+            selectCatalog(index,buttons,checkbox);
         }
     } else if (PtInRect(&mediaRect_, point)) beginCanvasGesture(point, (buttons & MK_CONTROL) != 0);
 }
@@ -1910,6 +1951,10 @@ void App::wheel(WPARAM wparam, LPARAM lparam)
             }
         }
     }
+    if(PtInRect(&detailsRect_,point)) {
+        if(studio_&&detail_==Detail::renameStudio) SendMessageW(studio_->window(),WM_MOUSEWHEEL,wparam,lparam);
+        return;
+    }
     if (PtInRect(&catalogRect_, point)) {
         if (keys & MK_CONTROL) {
             thumb_ = std::clamp(thumb_ + static_cast<int>(steps * 12), 86, 178);
@@ -1917,7 +1962,7 @@ void App::wheel(WPARAM wparam, LPARAM lparam)
             layout();
             revealSelection();
         } else scrollCatalog(-static_cast<int>(steps * dp(88)));
-    } else if (player_) {
+    } else if(player_&&PtInRect(&mediaRect_,point)) {
         if (keys & MK_SHIFT && kind_ != MediaKind::image) player_->seekRelative(steps * 5.0);
         else if (keys & MK_CONTROL || kind_ != MediaKind::video) player_->changeZoom(steps * 0.16);
         else setVolume(playback_.volume + steps * 5.0);
@@ -1942,13 +1987,22 @@ void App::openStudio()
     layout();
 }
 
+void App::closeStudio()
+{
+    if(detail_!=Detail::renameStudio) return;
+    detail_=Detail::none;
+    if(studio_) studio_->hide();
+    SetFocus(window_);
+    layout();
+}
+
 void App::syncStudio()
 {
     if(!studio_||!renameEnabled_) return;
     std::vector<fs::path> paths;
     for(const auto& file:directoryFiles_) paths.push_back(file.path);
     std::vector<fs::path> selected(selectedFiles_.begin(),selectedFiles_.end());
-    if(selected.empty()&&!path_.empty()) selected.push_back(path_);
+    if(selected.empty()&&!selectMode_&&!path_.empty()) selected.push_back(path_);
     studio_->setFiles(std::move(paths),std::move(selected));
 }
 
@@ -1966,16 +2020,17 @@ void App::acceptLibraryChanges()
 {
     if(!studio_) return;
     const auto changes=studio_->takeFileChanges();
+    bool viewedFileMoved=false;
     if(changes) {
         for(const auto& [oldPath,newPath]:changes->changes) {
-            if(samePath(path_,oldPath)) path_=newPath;
+            if(samePath(path_,oldPath)) {path_=newPath;viewedFileMoved=true;}
             if(selectedFiles_.erase(oldPath)) selectedFiles_.insert(newPath);
         }
         if(!changes->message.empty()) status_=changes->message;
     }
     if(std::exchange(libraryChangesPending_,false)) {
         auto path=path_;
-        if(!path.empty()) openMedia(path);
+        if(!path.empty()&&(!player_||viewedFileMoved)) openMedia(path);
         catalog_->scan(directory_,++generation_);
     }
     rebuildCollectionView();
@@ -2044,11 +2099,35 @@ void App::layoutCollectionTiles()
     collectionExtent_=cursor+dp(8);
 }
 
+RECT App::checkboxRect(RECT item) const
+{
+    return {item.left+dp(5),item.top+dp(4),item.left+dp(22),item.top+dp(21)};
+}
+
+int App::catalogItemAt(POINT point) const
+{
+    if(!PtInRect(&catalogRect_,point)||point.y<catalogRect_.top+catalogHeaderHeight()) return -1;
+    if(groupedCatalog()) {
+        for(std::size_t index=0;index<files_.size();++index) {
+            const auto bounds=itemRect(index);
+            if(PtInRect(&bounds,point)) return static_cast<int>(index);
+        }
+        return -1;
+    }
+    const bool bottom=panel_==Panel::bottom;
+    const int index=bottom?(point.x-catalogRect_.left-dp(10)+scroll_)/strideX():
+        ((point.y-catalogRect_.top-catalogHeaderHeight()+scroll_)/strideY())*columns()+
+        (point.x-catalogRect_.left-dp(10))/strideX();
+    if(index<0||index>=static_cast<int>(files_.size())) return -1;
+    const auto bounds=itemRect(static_cast<std::size_t>(index));
+    return PtInRect(&bounds,point)?index:-1;
+}
+
 void App::selectCatalog(int index,UINT keys,bool checkbox)
 {
     if(index<0||index>=static_cast<int>(files_.size())) return;
     const auto file=files_[static_cast<std::size_t>(index)].path;
-    if(renameEnabled_&&(checkbox||selectMode_||(keys&(MK_CONTROL|MK_SHIFT)))) {
+    if(renameEnabled_&&(checkbox||(keys&(MK_CONTROL|MK_SHIFT)))) {
         if((keys&MK_SHIFT)&&selectionAnchor_>=0&&selectionAnchor_<static_cast<int>(files_.size())) {
             for(int item=std::min(index,selectionAnchor_);item<=std::max(index,selectionAnchor_);++item) {
                 selectedFiles_.insert(files_[static_cast<std::size_t>(item)].path);
@@ -2150,7 +2229,7 @@ void App::openMenu(POINT point, bool tray)
     }
     menuItem(menu, openFile, L"Открыть файл…\tCtrl+O");
     menuItem(menu, openFolder, L"Открыть папку…\tCtrl+Shift+O");
-    if(renameEnabled_) menuItem(menu,static_cast<UINT>(Control::renameStudio),L"Переименование и коллекция");
+    if(renameEnabled_) menuItem(menu,libraryOpenStudio,L"Переименование и коллекция");
     if (!tray) {
         menuItem(menu, static_cast<UINT>(Control::fullScreen), L"Полный экран\tF11");
         menuItem(menu, resetZoom, L"Вписать в окно\t0");
@@ -2186,6 +2265,84 @@ void App::openMenu(POINT point, bool tray)
     if (picked) command(picked);
 }
 
+HMENU App::makeFileMenu(const fs::path& file) const
+{
+    HMENU menu=CreatePopupMenu();
+    auto name=file.filename().wstring();
+    if(name.size()>64) name=name.substr(0,61)+L"…";
+    for(std::size_t at=0;(at=name.find(L'&',at))!=std::wstring::npos;at+=2) name.insert(at,1,L'&');
+    AppendMenuW(menu,MF_STRING|MF_DISABLED,0,name.c_str());
+    AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
+    menuItem(menu,filePreview,L"Открыть во Viewery");
+    menuItem(menu,fileReveal,L"Показать в Проводнике");
+    AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
+    menuItem(menu,fileCopy,L"Копировать файл");
+    menuItem(menu,fileCopyPath,L"Копировать путь");
+    menuItem(menu,fileCopyName,L"Копировать имя");
+    if(renameEnabled_) {
+        AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
+        menuItem(menu,fileSelect,selectedFiles_.contains(file)?L"Убрать из выделения":L"Добавить в выделение");
+        menuItem(menu,fileRename,selectedFiles_.contains(file)&&selectedFiles_.size()>1?
+            L"Переименовать выбранные…":L"Переименовать файл…");
+    }
+    AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
+    menuItem(menu,fileProperties,L"Свойства");
+    return menu;
+}
+
+void App::fileMenu(POINT point,const fs::path& file)
+{
+    const fs::path target=file;
+    HMENU menu=makeFileMenu(target);
+    const UINT picked=static_cast<UINT>(TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON|TPM_NONOTIFY,
+        point.x,point.y,0,window_,nullptr));
+    DestroyMenu(menu);
+    if(picked) fileCommand(picked,target);
+}
+
+void App::fileCommand(UINT action,const fs::path& file)
+{
+    switch(action) {
+    case filePreview:openMedia(file);syncStudio();return;
+    case fileCopyPath:copyText(window_,file.wstring());return;
+    case fileCopyName:copyText(window_,file.filename().wstring());return;
+    case fileCopy:
+        if(!copyFile(window_,file)) MessageBoxW(window_,L"Не удалось скопировать файл в буфер обмена.",L"Копирование",MB_OK|MB_ICONWARNING);
+        return;
+    case fileSelect:
+        if(!selectedFiles_.erase(file)) selectedFiles_.insert(file);
+        syncStudio();InvalidateRect(window_,&catalogRect_,FALSE);return;
+    case fileRename:
+        if(!selectedFiles_.contains(file)) {selectedFiles_.clear();selectedFiles_.insert(file);}
+        openStudio();return;
+    case fileProperties: {
+        SHELLEXECUTEINFOW request{sizeof(request)};
+        request.fMask=SEE_MASK_INVOKEIDLIST|SEE_MASK_FLAG_NO_UI;
+        request.hwnd=window_;request.lpVerb=L"properties";request.lpFile=file.c_str();request.nShow=SW_SHOWNORMAL;
+        if(!ShellExecuteExW(&request)) MessageBoxW(window_,L"Не удалось открыть свойства файла.",L"Свойства",MB_OK|MB_ICONWARNING);
+        return;
+    }
+    case fileReveal: {
+        PIDLIST_ABSOLUTE item=nullptr;
+        HRESULT result=SHParseDisplayName(file.c_str(),nullptr,&item,0,nullptr);
+        if(SUCCEEDED(result)) {
+            PIDLIST_ABSOLUTE folder=ILCloneFull(item);
+            if(folder) {
+                if(ILRemoveLastID(folder)) {
+                    PCUITEMID_CHILD child=ILFindLastID(item);
+                    result=SHOpenFolderAndSelectItems(folder,1,&child,0);
+                } else result=E_INVALIDARG;
+                CoTaskMemFree(folder);
+            } else result=E_OUTOFMEMORY;
+            CoTaskMemFree(item);
+        }
+        if(FAILED(result)) MessageBoxW(window_,L"Не удалось показать файл в Проводнике.",L"Расположение файла",MB_OK|MB_ICONWARNING);
+        return;
+    }
+    default:return;
+    }
+}
+
 void App::catalogMenu(POINT point)
 {
     HMENU menu = CreatePopupMenu();
@@ -2212,7 +2369,7 @@ void App::catalogMenu(POINT point)
         menuItem(menu,selectionAll,L"Выделить все\tCtrl+A");
         menuItem(menu,selectionClear,L"Снять выделение");
         menuItem(menu,selectionGroup,L"Выделить группу активного файла");
-        menuItem(menu,static_cast<UINT>(Control::renameStudio),L"Переименовать выбранные…");
+        menuItem(menu,libraryOpenStudio,L"Переименовать выбранные…");
         HMENU group=CreatePopupMenu();
         menuItem(group,groupNone,L"Без группировки",collectionOptions_.group==CollectionGroup::none);
         menuItem(group,groupArtist,L"Художник → работа → версии",collectionOptions_.group==CollectionGroup::artist);
@@ -2318,8 +2475,12 @@ void App::command(UINT id)
     }
     case openFile: choose(false); return;
     case openFolder: choose(true); return;
-    case static_cast<UINT>(Control::renameStudio):openStudio();return;
-    case selectionMode:selectMode_=!selectMode_;layout();return;
+    case static_cast<UINT>(Control::renameStudio):
+        if(detail_==Detail::renameStudio) closeStudio();else openStudio();
+        return;
+    case libraryOpenStudio:openStudio();return;
+    case RenameStudio::closeCommandId:closeStudio();return;
+    case selectionMode:selectMode_=!selectMode_;syncStudio();layout();return;
     case selectionClear:selectedFiles_.clear();syncStudio();layout();return;
     case selectionAll:
         if(renameEnabled_) for(const auto& file:files_) selectedFiles_.insert(file.path);
@@ -2694,7 +2855,8 @@ LRESULT App::dispatch(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
         break;
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORSTATIC:
-        if (reinterpret_cast<HWND>(lparam) == rangeStart_ || reinterpret_cast<HWND>(lparam) == rangeEnd_) {
+        if(reinterpret_cast<HWND>(lparam)==rangeStart_||reinterpret_cast<HWND>(lparam)==rangeEnd_||
+           reinterpret_cast<HWND>(lparam)==catalogSearch_) {
             HDC dc = reinterpret_cast<HDC>(wparam);
             SetTextColor(dc, textColor);
             SetBkColor(dc, raised);
@@ -2702,6 +2864,7 @@ LRESULT App::dispatch(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
         }
         break;
     case WM_COMMAND:
+        if(LOWORD(wparam)==RenameStudio::closeCommandId) {closeStudio();return 0;}
         if(LOWORD(wparam)==catalogSearchId&&HIWORD(wparam)==EN_CHANGE&&studio_) {
             std::wstring value(static_cast<std::size_t>(GetWindowTextLengthW(catalogSearch_))+1,L'\0');
             value.resize(static_cast<std::size_t>(GetWindowTextW(catalogSearch_,value.data(),static_cast<int>(value.size()))));
@@ -2806,10 +2969,21 @@ LRESULT App::dispatch(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
             return 0;
         }
         POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-        if (point.x == -1 && point.y == -1) GetCursorPos(&point);
+        const bool keyboard=point.x==-1&&point.y==-1;
+        if(keyboard&&current_>=0&&current_<static_cast<int>(files_.size())&&!IsRectEmpty(&catalogRect_)) {
+            const auto item=itemRect(static_cast<std::size_t>(current_));
+            point={item.left+spanX(item)/2,item.top+spanY(item)/2};
+            RECT viewport=catalogRect_;viewport.top+=catalogHeaderHeight();
+            if(PtInRect(&viewport,point)) {
+                ClientToScreen(window_,&point);
+                fileMenu(point,files_[static_cast<std::size_t>(current_)].path);return 0;
+            }
+        }
+        if(keyboard) GetCursorPos(&point);
         POINT local = point;
         ScreenToClient(window, &local);
-        if (PtInRect(&catalogRect_, local)) catalogMenu(point);
+        if(const int index=catalogItemAt(local);index>=0) fileMenu(point,files_[static_cast<std::size_t>(index)].path);
+        else if(PtInRect(&catalogRect_, local)) catalogMenu(point);
         else openMenu(point, false);
         return 0;
     }
@@ -2823,6 +2997,16 @@ int App::run()
     MSG event{};
     while (GetMessageW(&event, nullptr, 0, 0) > 0) {
         const bool studioInput=studio_&&(event.hwnd==studio_->window()||IsChild(studio_->window(),event.hwnd));
+        if(studioInput&&event.message==WM_KEYDOWN&&event.wParam==VK_ESCAPE) {
+            wchar_t className[32]{};GetClassNameW(event.hwnd,className,32);
+            HWND combo=nullptr;
+            if(wcscmp(className,L"ComboBox")==0) combo=event.hwnd;
+            else if(HWND parent=GetParent(event.hwnd);parent) {
+                GetClassNameW(parent,className,32);
+                if(wcscmp(className,L"ComboBox")==0) combo=parent;
+            }
+            if(!combo||!SendMessageW(combo,CB_GETDROPPEDSTATE,0,0)) {closeStudio();continue;}
+        }
         if(studioInput&&event.message==WM_KEYDOWN&&event.wParam==VK_TAB&&IsDialogMessageW(studio_->window(),&event)) continue;
         if (window_ && IsChild(window_, event.hwnd) && event.hwnd != rangeStart_ && event.hwnd != rangeEnd_ &&
             event.hwnd!=catalogSearch_&&!studioInput&&
