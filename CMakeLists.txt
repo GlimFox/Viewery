@@ -5,18 +5,6 @@ if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR NOT MSVC)
     message(FATAL_ERROR "Viewery requires Windows x64 and the Microsoft C++ toolchain.")
 endif()
 
-option(VIEWERY_GUI_TESTS "Enable isolated native Rename Studio GUI checks" OFF)
-if(BUILD_TESTING AND VIEWERY_GUI_TESTS)
-    add_executable(viewery-rename-studio-tests tests/rename_studio_smoke.cpp
-        src/rename_studio.cpp src/rename_template.cpp src/library.cpp src/frame_image.cpp)
-    viewery_target(viewery-rename-studio-tests)
-    target_link_libraries(viewery-rename-studio-tests PRIVATE
-        comctl32 uxtheme user32 gdi32 ole32 shell32 windowscodecs bcrypt)
-    add_test(NAME rename-studio-gui COMMAND viewery-rename-studio-tests
-        "${CMAKE_BINARY_DIR}/studio-gui-test-data")
-    set_tests_properties(rename-studio-gui PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
-endif()
-
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 file(TO_CMAKE_PATH "$ENV{INCLUDE}" viewery_windows_includes)
@@ -94,3 +82,16 @@ if(BUILD_TESTING AND VIEWERY_MEDIA_TESTS)
         "${fixtures}/sample.mp4" "${fixtures}")
     set_tests_properties(playback gif-export PROPERTIES FIXTURES_REQUIRED media TIMEOUT 60)
 endif()
+
+option(VIEWERY_GUI_TESTS "Enable isolated native Rename Studio GUI checks" OFF)
+if(BUILD_TESTING AND VIEWERY_GUI_TESTS)
+    add_executable(viewery-rename-studio-tests tests/rename_studio_smoke.cpp
+        src/rename_studio.cpp src/rename_template.cpp src/library.cpp src/frame_image.cpp)
+    viewery_target(viewery-rename-studio-tests)
+    target_link_libraries(viewery-rename-studio-tests PRIVATE
+        comctl32 uxtheme user32 gdi32 ole32 shell32 windowscodecs bcrypt)
+    add_test(NAME rename-studio-gui COMMAND viewery-rename-studio-tests
+        "${CMAKE_BINARY_DIR}/studio-gui-test-data")
+    set_tests_properties(rename-studio-gui PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+endif()
+

@@ -70,7 +70,7 @@ try {
     [void] [IO.Directory]::CreateDirectory((Join-Path $payload 'licenses'))
     Copy-Item -LiteralPath (Join-Path $repo 'src/third_party/json.LICENSE.MIT') -Destination (Join-Path $payload 'licenses/nlohmann-json.MIT.txt')
     [void] [IO.Directory]::CreateDirectory((Join-Path $payload 'docs'))
-    Copy-Item -LiteralPath (Join-Path $repo 'docs/RELEASE.md') -Destination (Join-Path $payload 'docs/RELEASE.md')
+    Get-ChildItem -LiteralPath (Join-Path $repo 'docs') | Copy-Item -Destination (Join-Path $payload 'docs') -Recurse
     if ($SigningThumbprint) {
         $SigningThumbprint = $SigningThumbprint -replace '\s',''
         if ($SigningThumbprint -notmatch '^[0-9a-fA-F]{40}$') { throw 'Expected 40-digit signing certificate thumbprint.' }

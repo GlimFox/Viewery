@@ -95,6 +95,7 @@ int wmain(int argc,wchar_t** argv) {
     const fs::path outputRoot=fs::absolute(argv[1]);
     const fs::path folder=outputRoot/(L"run-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
     const auto desktopName=L"VieweryStudioQA-"+std::to_wstring(GetCurrentProcessId());
+    const HDESK previousDesktop=GetThreadDesktop(GetCurrentThreadId());
     HDESK desktop=CreateDesktopW(desktopName.c_str(),nullptr,nullptr,0,GENERIC_ALL,nullptr);
     if(!desktop||!SetThreadDesktop(desktop)) {
         const DWORD error=GetLastError();
@@ -104,15 +105,17 @@ int wmain(int argc,wchar_t** argv) {
     }
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const HRESULT com=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
-    if(FAILED(com)) {CloseDesktop(desktop);return 4;}
+    if(FAILED(com)) {SetThreadDesktop(previousDesktop);CloseDesktop(desktop);return 4;}
     HWND host=nullptr;
     HFONT font=nullptr;
     try {
+        fs::create_directories(folder);
         const INITCOMMONCONTROLSEX init{sizeof(init),ICC_LISTVIEW_CLASSES|ICC_BAR_CLASSES};InitCommonControlsEx(&init);
         WNDCLASSW wc{};wc.hInstance=GetModuleHandleW(nullptr);wc.lpfnWndProc=DefWindowProcW;
         wc.lpszClassName=L"Viewery.StudioQAHost.1";RegisterClassW(&wc);
         host=CreateWindowExW(0,wc.lpszClassName,L"Viewery Rename Studio",WS_OVERLAPPEDWINDOW|WS_VISIBLE,
             0,0,650,850,nullptr,nullptr,wc.hInstance,nullptr);
+        require(host!=nullptr,"Private desktop host window is created");
         font=CreateFontW(-14,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,0,L"Segoe UI");
         const auto one=folder/L"image001.png",two=folder/L"image002.png",three=folder/L"keep.png";
@@ -199,15 +202,18 @@ int wmain(int argc,wchar_t** argv) {
         require(content(one)=="first bytes"&&content(two)=="second bytes"&&beforeChanges==2,
                 "Undo preserves both file contents");
         std::cout<<"Studio GUI checks passed.\n";
-        std::wcout<<L"Artifacts: "<<folder.wstring()<<L"\n";
+        const auto artifactPath=folder.u8string();
+        std::cout<<"Artifacts: ";
+        std::cout.write(reinterpret_cast<const char*>(artifactPath.data()),static_cast<std::streamsize>(artifactPath.size()));
+        std::cout<<'\n';
         studio.reset();
         DeleteObject(font);font=nullptr;
         DestroyWindow(host);host=nullptr;
     } catch(const std::exception& error) {
         std::cerr<<error.what()<<std::endl;
-        if(host)DestroyWindow(host);if(font)DeleteObject(font);CoUninitialize();CloseDesktop(desktop);return 1;
+        if(host)DestroyWindow(host);if(font)DeleteObject(font);CoUninitialize();SetThreadDesktop(previousDesktop);CloseDesktop(desktop);return 1;
     }
-    CoUninitialize();CloseDesktop(desktop);return 0;
+    CoUninitialize();SetThreadDesktop(previousDesktop);CloseDesktop(desktop);return 0;
 }
 
 
