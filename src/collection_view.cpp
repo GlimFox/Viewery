@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cwchar>
 #include <map>
+#include <cwctype>
 #include <set>
 #include <string_view>
 #include <utility>
@@ -56,11 +57,48 @@ struct Item {
     const Artwork* work = nullptr;
     const MediaVersion* version = nullptr;
     std::vector<const Artist*> artists;
+    std::vector<Artist> inferredArtists;
     std::filesystem::path path;
     std::wstring name, extension, title, authorNames;
     std::size_t ordinal = 0;
     std::int64_t order = 0;
 };
+
+std::wstring trimName(std::wstring name)
+{
+    const auto start=name.find_first_not_of(L" _-\t");
+    if(start==std::wstring::npos) return {};
+    return name.substr(start,name.find_last_not_of(L" _-\t")-start+1);
+}
+
+std::wstring artistFromName(const std::filesystem::path& path)
+{
+    const auto stem=path.stem().wstring();
+    std::wstring name;
+    if(stem.starts_with(L"[")) {
+        const auto end=stem.find(L']',1);
+        if(end!=std::wstring::npos) name=stem.substr(1,end-1);
+    }
+    if(name.empty()) {
+        for(std::size_t at=1;at+1<stem.size();++at) {
+            if((stem[at]==L'_'||stem[at]==L'-')&&iswdigit(stem[at+1])) {
+                name=stem.substr(0,at);break;
+            }
+        }
+    }
+    if(name.empty()) {
+        const auto at=stem.find(L" - ");
+        if(at!=std::wstring::npos) name=stem.substr(0,at);
+    }
+    name=trimName(std::move(name));
+    if(name.size()>120||name.empty()||!std::ranges::any_of(name,[](wchar_t ch){
+        WORD type=0;return GetStringTypeW(CT_CTYPE1,&ch,1,&type)&&(type&C1_ALPHA)!=0;
+    })) return {};
+    const auto key=folded(name);
+    static const std::set<std::wstring> generic{L"IMAGE",L"IMG",L"PHOTO",L"PICTURE",L"SCREENSHOT",L"SCREEN",L"FRAME",
+        L"CAPTURE",L"VIDEO",L"DSC",L"PIC",L"CANVAS",L"UNTITLED",L"DOWNLOAD",L"ФОТО",L"СКРИНШОТ"};
+    return generic.contains(key)?std::wstring{}:name;
+}
 
 std::int64_t customOrder(const MediaRecord* file, std::size_t ordinal)
 {
@@ -139,6 +177,12 @@ std::vector<Item> matchingItems(const CollectionSnapshot& collection,
     const auto artists = recordIndex(collection.artists);
     const auto works = recordIndex(collection.artworks);
     const auto versions = recordIndex(collection.versions);
+    std::map<std::wstring,const Artist*> artistNames;
+    for(const auto& artist:collection.artists) {
+        artistNames.emplace(folded(artist.name),&artist);
+        if(!artist.fileName.empty()) artistNames.emplace(folded(artist.fileName),&artist);
+    }
+    const bool inferNames=options.group==CollectionGroup::artist||options.sort==CollectionSort::artist||!options.filter.artist.empty();
     auto filter = options.filter;
     filter.text = folded(filter.text);
     filter.artist = folded(filter.artist);
@@ -173,6 +217,33 @@ std::vector<Item> matchingItems(const CollectionSnapshot& collection,
                 item.title = displayedTitle(item.work);
             }
         }
+        if(inferNames&&item.artists.empty()) {
+            auto name=artistFromName(item.path);
+            if(name.empty()) {
+                auto stem=item.path.stem().wstring();
+                if(const auto suffix=stem.find(L'(');suffix!=std::wstring::npos) stem=trimName(stem.substr(0,suffix));
+                if(const auto known=artistNames.find(folded(stem));known!=artistNames.end()) name=known->second->name;
+            }
+            if(!name.empty()) {
+                std::size_t start=0;
+                do {
+                    const auto end=name.find(L'&',start);
+                    auto author=trimName(name.substr(start,end==std::wstring::npos?end:end-start));
+                    if(!author.empty()) {
+                        const auto known=artistNames.find(folded(author));
+                        if(known!=artistNames.end()) item.inferredArtists.push_back(*known->second);
+                        else {Artist inferred;inferred.id=L"filename:"+folded(author);inferred.name=std::move(author);item.inferredArtists.push_back(std::move(inferred));}
+                    }
+                    if(end==std::wstring::npos) break;
+                    start=end+1;
+                } while(start<name.size());
+                for(const auto& author:item.inferredArtists) {
+                    item.artists.push_back(&author);
+                    if(!item.authorNames.empty()) item.authorNames+=L" & ";
+                    item.authorNames+=author.name;
+                }
+            }
+        }
         item.order = customOrder(item.file, ordinal);
         if (matches(item, filter)) result.push_back(std::move(item));
     }
@@ -188,7 +259,9 @@ int compare(Value a, Value b)
 int compareItems(const Item& a, const Item& b, CollectionSort sort)
 {
     switch (sort) {
-    case CollectionSort::artist: return natural(a.authorNames, b.authorNames);
+    case CollectionSort::artist:
+        if(a.authorNames.empty()!=b.authorNames.empty()) return a.authorNames.empty()?1:-1;
+        return natural(a.authorNames,b.authorNames);
     case CollectionSort::number: return compare(a.work ? a.work->number : 0, b.work ? b.work->number : 0);
     case CollectionSort::title: return natural(a.title, b.title);
     case CollectionSort::version: return compare(a.version ? a.version->number : 0, b.version ? b.version->number : 0);
@@ -370,15 +443,22 @@ void appendArtistGroups(CollectionViewResult& view, const std::vector<const Item
         (void) id;
         ordered.push_back(std::move(artist));
     }
-    std::ranges::sort(ordered, [](const Bucket& a, const Bucket& b) {
-        return a.number != b.number ? a.number < b.number : natural(a.label, b.label) < 0;
+    std::ranges::sort(ordered,[&options](const Bucket& a,const Bucket& b) {
+        if(a.id.empty()!=b.id.empty()) return !a.id.empty();
+        if(options.sort==CollectionSort::custom&&a.number!=b.number) return a.number<b.number;
+        return natural(a.label,b.label)<0;
     });
     for (const auto& artist : ordered) {
         const auto key = branch(L"", L"artist", artist.id);
         const auto total = counts(artist.files);
-        const auto label = artist.label + L" — " + std::to_wstring(total.works) + L" работ · " +
-                           std::to_wstring(total.files) + L" файлов";
-        if (appendGroup(view, key, label, artist.files, {}, options)) appendWorkGroups(view, artist.files, {key}, options);
+        const auto label=artist.label+L" — "+(total.works?std::to_wstring(total.works)+L" работ · ":std::wstring{})+
+            std::to_wstring(total.files)+L" файлов";
+        const bool expanded=appendGroup(view,key,label,artist.files,{},options);
+        view.rows.back().artistName=artist.label;
+        if(expanded) {
+            if(total.works) appendWorkGroups(view,artist.files,{key},options);
+            else appendFiles(view,artist.files,{key});
+        }
     }
 }
 
