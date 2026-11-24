@@ -128,6 +128,86 @@ void checkWindowsNames()
            "Long filename truncation never leaves an unpaired high surrogate");
 }
 
+void checkInferredTitles()
+{
+    using namespace viewery;
+    const std::vector<Artist> artists{
+        {L"fox",L"Глим",L"glimfox",L"oldfox; Старый Лис, fox\r\nglim_fox",0,{}}
+    };
+    const std::pair<std::wstring_view,std::wstring_view> cases[]{
+        {L"glimfox_aaa",L"aaa"},
+        {L"GLIMFOX_001_v01_aaa",L"aaa"},
+        {L"glimfox_1001_V125_aaa.final",L"aaa.final"},
+        {L"oldfox_001_v01_aaa",L"aaa"},
+        {L"СТАРЫЙ ЛИС_001_v01_Рассвет",L"Рассвет"},
+        {L"ГЛИМ_Рассвет",L"Рассвет"},
+        {L"glim_fox_001_v01_aaa",L"aaa"},
+        {L"[glimfox]_001_v01_aaa",L"aaa"},
+        {L"[oldfox] - aaa",L"aaa"},
+        {L"glimfox - aaa",L"aaa"},
+        {L"glimfox-aaa",L"aaa"},
+        {L"glimfox aaa",L"aaa"},
+        {L"glimfox_2024_photo",L"2024_photo"},
+        {L"glimfox_001_title",L"001_title"},
+        {L"glimfox_v01_title",L"v01_title"},
+        {L"glimfox_000_v01_title",L"000_v01_title"},
+        {L"glimfox_001_v00_title",L"001_v00_title"},
+        {L"glimfox_001_v01title",L"001_v01title"},
+        {L"glimfox_001_v01_title_001_v02",L"title_001_v02"},
+        {L"glimfox_001_v01_glimfox_title",L"glimfox_title"},
+        {L"before_glimfox_001_v01_aaa",L"before_glimfox_001_v01_aaa"},
+        {L"glimfoxLong_001_v01_aaa",L"glimfoxLong_001_v01_aaa"},
+        {L"[glimfox]aaa",L"[glimfox]aaa"},
+        {L"other_001_v01_aaa",L"other_001_v01_aaa"},
+        {L"glimfox & Unknown_001_v01_aaa",L"glimfox & Unknown_001_v01_aaa"},
+        {L"glimfox",L""},
+        {L"glimfox_001_v01",L""},
+        {L"",L""}
+    };
+    for(const auto& [source,expected]:cases) {
+        const auto inferred=inferOriginalTitle(source,artists);
+        if(inferred!=expected) std::wcerr<<L"Source: "<<source<<L"; inferred: "<<inferred<<L"; expected: "<<expected<<L'\n';
+        expect(inferred==expected,"Blank-title inference changes only a recognized complete leading artist prefix");
+    }
+    expect(inferOriginalTitle(L"glimfox_001_v01_aaa",{})==L"glimfox_001_v01_aaa",
+           "Without a selected artist the source title is untouched");
+    auto coauthors=artists;
+    coauthors.push_back({L"co",L"Coauthor",L"Co",L"Collaborator",0,{}});
+    expect(inferOriginalTitle(L"glimfox & Co_001_v01_aaa",coauthors)==L"aaa"&&
+           inferOriginalTitle(L"[glimfox] + [Collaborator]_001_v01_aaa",coauthors)==L"aaa",
+           "Selected coauthor prefixes are removed together without leaving joined names in the inferred title");
+    auto longest=artists;longest.push_back({L"long",L"Long Artist",L"glimfox_long",{},0,{}});
+    expect(inferOriginalTitle(L"glimfox_long_001_v01_aaa",longest)==L"aaa",
+           "Longest selected artist spelling wins over its shorter prefix");
+    expect(inferOriginalTitle(L"Студия_Лис_001_v01_Рассвет",{{L"studio",L"Студия:Лис",{}, {},0,{}}})==L"Рассвет",
+           "Artist prefixes recognize the spelling repaired for Windows filenames");
+
+    CollectionSnapshot snapshot;
+    snapshot.artists=artists;
+    snapshot.artworks.push_back({L"work",{L"fox"},1,{}, {},true,{}});
+    snapshot.versions.push_back({L"version",L"work",1,{},true,{}});
+    MediaRecord file{L"file",L"C:\\media\\glimfox_aaa.PNG",L"glimfox_aaa.PNG",L".PNG",L"work",L"version",0,0,{}};
+    snapshot.artworks.front().title=inferOriginalTitle(file.path.stem().wstring(),artists);
+    const auto preset=defaultArtistTemplate();
+    const auto first=renderName(preset,snapshot,file);
+    expect(first==L"glimfox_001_v01_aaa.PNG","Inferred default title avoids duplicating the source artist and preserves extension case");
+    file.path=file.path.parent_path()/first;
+    snapshot.artworks.front().number=2;
+    snapshot.artworks.front().title=inferOriginalTitle(file.path.stem().wstring(),artists);
+    expect(renderName(preset,snapshot,file)==L"glimfox_002_v01_aaa.PNG",
+           "Repeated default naming never nests previous work or version prefixes in the title");
+    snapshot.artworks.front().title=L"glimfox_001_v01_Intentional title";
+    expect(renderName(preset,snapshot,file)==L"glimfox_002_v01_glimfox_001_v01_Intentional title.PNG",
+           "An explicitly supplied title is never cleaned by the renderer");
+    snapshot.artworks.front().userTitle=L"glimfox - My custom title";
+    expect(renderName(preset,snapshot,file)==L"glimfox_002_v01_glimfox - My custom title.PNG",
+           "Explicit user title overrides remain literal");
+    expect(renderName(oneBlock(NameBlockKind::original),snapshot,file)==L"glimfox_aaa.PNG",
+           "Original-name template blocks preserve the original prefix by design");
+    expect(renderName(oneBlock(NameBlockKind::literal,L"glimfox_001_v01_aaa"),snapshot,file)==L"glimfox_001_v01_aaa.PNG",
+           "Literal template blocks are unaffected by inferred-title normalization");
+}
+
 void checkJson()
 {
     using namespace viewery;
@@ -164,6 +244,7 @@ int main()
         checkArtists();
         checkCounters();
         checkWindowsNames();
+        checkInferredTitles();
         checkJson();
         std::cout << "Rename template checks passed.\n";
         return 0;

@@ -41,6 +41,14 @@ struct RenameTemplate {
 RenameTemplate defaultArtistTemplate();
 std::wstring_view nameBlockLabel(NameBlockKind kind);
 
+// Infer a title only when the user left it blank. sourceStem is the current
+// filename without its extension. Strip one leading selected artist prefix
+// (name/fileName/alias, optionally bracketed), then a complete _number_vnumber
+// pair if present. Unrecognized text and partial numeric prefixes are retained.
+// Explicit titles and literal/original template blocks must bypass this helper.
+std::wstring inferOriginalTitle(std::wstring_view sourceStem,
+                                const std::vector<Artist>& selectedArtists);
+
 // sequence is a one-based ordinal for this selected set or its counter group.
 // Stored work/version numbers are independent of the sequential counter.
 std::wstring renderName(const RenameTemplate& preset, const CollectionSnapshot& collection,

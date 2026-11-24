@@ -63,7 +63,7 @@ constexpr UINT refreshTimer = 1;
 constexpr UINT canvasClickTimer = 2;
 constexpr UINT filenameTimer = 3;
 #ifndef VIEWERY_VERSION
-#define VIEWERY_VERSION "0.2.0-beta.6"
+#define VIEWERY_VERSION "0.2.0-beta.7"
 #endif
 
 constexpr COLORREF background = RGB(14, 16, 21);

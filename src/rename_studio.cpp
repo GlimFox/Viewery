@@ -181,6 +181,10 @@ struct RenameStudio::Impl {
     CollectionSnapshot data;
     std::vector<LibraryPreset> presets;
     RenameTemplate naming=defaultArtistTemplate();
+    std::vector<LibraryId> artistChoices;
+    LibraryId selectedArtistId;
+    std::wstring selectedArtistText;
+    bool selectingArtist=false;
     LibraryId selectedWorkId;
     LibraryId selectedOperationId;
     std::vector<RenamePreview> preview;
@@ -691,6 +695,9 @@ struct RenameStudio::Impl {
         SetWindowTextW(c(artist),value.c_str());
         filling=wasFilling;
         data=std::move(snapshot);
+        const auto selected=std::ranges::find(data.artists,selectedArtistId,&Artist::id);
+        if(selected==data.artists.end()) {selectedArtistId.clear();selectedArtistText.clear();}
+        else selectedArtistText=selected->name;
     }
     void beginIndex() {
         if(busy()) { indexPending=true;return; }
@@ -774,7 +781,14 @@ struct RenameStudio::Impl {
         filling=true;
         const auto artistValue=text(c(artist)),workValue=text(c(work));
         SendMessageW(c(artist),CB_RESETCONTENT,0,0);
-        for(const auto& a:data.artists) item(artist,a.name.c_str());
+        artistChoices.clear();
+        for(const auto& a:data.artists) {
+            const auto row=SendMessageW(c(artist),CB_ADDSTRING,0,reinterpret_cast<LPARAM>(a.name.c_str()));
+            if(row>=0) {
+                const auto index=artistChoices.size();artistChoices.push_back(a.id);
+                SendMessageW(c(artist),CB_SETITEMDATA,static_cast<WPARAM>(row),static_cast<LPARAM>(index));
+            }
+        }
         SetWindowTextW(c(artist),artistValue.c_str());
         SendMessageW(c(work),CB_RESETCONTENT,0,0);
         for(const auto& a:data.artworks) {
@@ -786,6 +800,28 @@ struct RenameStudio::Impl {
             SendMessageW(c(work),CB_SETCURSEL,static_cast<WPARAM>(selected-data.artworks.begin()),0);
         } else SetWindowTextW(c(work),workValue.c_str());
         filling=false;
+    }
+    struct ArtistInput {std::wstring name;LibraryId id;};
+    std::vector<ArtistInput> artistInputs() const {
+        const auto value=trim(text(c(artist)));
+        if(!selectedArtistId.empty()&&(selectingArtist||sameName(value,selectedArtistText))) {
+            const auto selected=std::ranges::find(data.artists,selectedArtistId,&Artist::id);
+            if(selected!=data.artists.end()) return {{selected->name,selected->id}};
+        }
+        std::vector<ArtistInput> result;
+        for(const auto& name:split(value,L';')) result.push_back({name,{}});
+        return result;
+    }
+    void selectArtist() {
+        selectedArtistId.clear();selectedArtistText.clear();
+        const auto row=SendMessageW(c(artist),CB_GETCURSEL,0,0);
+        const auto index=row>=0?SendMessageW(c(artist),CB_GETITEMDATA,static_cast<WPARAM>(row),0):CB_ERR;
+        if(index>=0&&static_cast<std::size_t>(index)<artistChoices.size()) {
+            const auto selected=std::ranges::find(data.artists,artistChoices[static_cast<std::size_t>(index)],&Artist::id);
+            if(selected!=data.artists.end()) {selectedArtistId=selected->id;selectedArtistText=selected->name;}
+        }
+        // CBN_SELCHANGE arrives before an editable combo commits the new text.
+        selectingArtist=true;updateExample();selectingArtist=false;
     }
     void fillPresets() {
         const auto name=text(c(preset));
@@ -867,7 +903,7 @@ struct RenameStudio::Impl {
                     const auto mode=SendMessageW(c(assignment),CB_GETCURSEL,0,0);
                     Artwork workDraft;
                     const auto oldWork=std::ranges::find(snapshot.artworks,file.artworkId,&Artwork::id);
-                    if(oldWork!=snapshot.artworks.end()) workDraft=*oldWork;
+                    if(mode==3&&oldWork!=snapshot.artworks.end()) workDraft=*oldWork;
                     const auto selectedWork=SendMessageW(c(work),CB_GETCURSEL,0,0);
                     if(mode==2&&(selectedWork<0||selectedWork>=static_cast<LRESULT>(data.artworks.size()))) {
                         SetWindowTextW(c(liveExample),L"Выберите существующую работу");return;
@@ -875,22 +911,31 @@ struct RenameStudio::Impl {
                     if(mode==2&&selectedWork>=0&&selectedWork<static_cast<LRESULT>(data.artworks.size())) workDraft=data.artworks[static_cast<std::size_t>(selectedWork)];
                     const auto originalWorkId=workDraft.id;
                     const bool preserveExisting=mode==3&&oldWork!=snapshot.artworks.end();
-                    const auto names=split(text(c(artist)),L';');
+                    const auto inputs=artistInputs();
                     std::vector<LibraryId> authors;
-                    for(std::size_t i=0;i<names.size();++i) {
-                        const auto found=namedArtist(snapshot.artists,names[i]);
+                    for(std::size_t i=0;i<inputs.size();++i) {
+                        const auto byId=std::ranges::find(snapshot.artists,inputs[i].id,&Artist::id);
+                        const auto found=!inputs[i].id.empty()&&byId!=snapshot.artists.end()?&*byId:namedArtist(snapshot.artists,inputs[i].name);
                         if(found) {
                             if(std::ranges::find(authors,found->id)==authors.end()) authors.push_back(found->id);
                         }
                         else {
-                            Artist draft;draft.id=L"viewery-draft-artist-"+std::to_wstring(i);draft.name=names[i];draft.fileName=names[i];
+                            Artist draft;draft.id=L"viewery-draft-artist-"+std::to_wstring(i);draft.name=inputs[i].name;draft.fileName=inputs[i].name;
                             authors.push_back(draft.id);snapshot.artists.push_back(std::move(draft));
                         }
                     }
                     workDraft.id=L"viewery-draft-work";
-                    if(!names.empty()||mode!=2) workDraft.artists=authors;
+                    if(!inputs.empty()||mode!=2) workDraft.artists=authors;
+                    std::vector<Artist> titleArtists;
+                    for(const auto& id:authors) {
+                        const auto found=std::ranges::find(snapshot.artists,id,&Artist::id);
+                        if(found!=snapshot.artists.end()) titleArtists.push_back(*found);
+                    }
                     const auto suppliedTitle=trim(text(c(title)));
-                    if(!preserveExisting&&(mode!=2||!suppliedTitle.empty())) workDraft.title=suppliedTitle.empty()?file.path.stem().wstring():suppliedTitle;
+                    if(!preserveExisting&&(mode!=2||!suppliedTitle.empty())) {
+                        workDraft.title=suppliedTitle.empty()?inferOriginalTitle(file.path.stem().wstring(),titleArtists):suppliedTitle;
+                        if(!suppliedTitle.empty()) workDraft.userTitle.clear();
+                    }
                     auto number=integer(c(workNumber),0);
                     if(!preserveExisting&&(mode!=2||number>0)) {
                         if(!number) {
@@ -910,7 +955,13 @@ struct RenameStudio::Impl {
                     }
                     if(mode==3) {
                         const auto found=std::ranges::find(snapshot.versions,file.versionId,&MediaVersion::id);
-                        if(found!=snapshot.versions.end()) version.number=found->number;
+                        if(found!=snapshot.versions.end()&&found->artworkId==originalWorkId) version.number=found->number;
+                        else {
+                            version.number=1;
+                            if(!originalWorkId.empty()) for(const auto& existing:snapshot.versions) {
+                                if(existing.artworkId==originalWorkId) version.number=std::max(version.number,existing.number+1);
+                            }
+                        }
                     }
                     snapshot.versions.push_back(version);file.versionId=version.id;
                 }
@@ -938,7 +989,7 @@ struct RenameStudio::Impl {
     void assignMetadata(bool addToQueue=false) {
         const auto selected=selectedRecords();
         if(selected.empty()) throw LibraryError("Select files in the catalog first");
-        const auto names=split(text(c(artist)),L';');
+        const auto inputs=artistInputs();
         const auto extra=parseFields(text(c(fields)));
         const auto titleValue=trim(text(c(title)));
         const auto alias=text(c(aliases));
@@ -953,25 +1004,31 @@ struct RenameStudio::Impl {
         std::vector<RenameProposal> existingQueue;
         for(const auto& row:preview) existingQueue.push_back(row.proposal);
         const auto knownArtists=data.artists;
-        startJob([this,selected,names,extra,titleValue,alias,mode,chosenId,firstNumber,firstVersion,addToQueue,value,existingQueue,knownArtists]
+        startJob([this,selected,inputs,extra,titleValue,alias,mode,chosenId,firstNumber,firstVersion,addToQueue,value,existingQueue,knownArtists]
                  (CollectionStore& db,std::stop_token stop) {
             auto current=db.snapshot();
             std::vector<LibraryId> artists;
             std::set<LibraryId> savedArtists;
-            for(const auto& name:names) {
-                const auto bound=namedArtist(knownArtists,name);
-                const auto byId=bound?std::ranges::find(current.artists,bound->id,&Artist::id):current.artists.end();
-                if(bound&&byId==current.artists.end()) continue;
-                const auto found=bound?&*byId:namedArtist(current.artists,name);
+            for(const auto& input:inputs) {
+                const auto bound=input.id.empty()?namedArtist(knownArtists,input.name):nullptr;
+                const auto id=!input.id.empty()?input.id:bound?bound->id:LibraryId{};
+                const auto byId=std::ranges::find(current.artists,id,&Artist::id);
+                if(!id.empty()&&byId==current.artists.end()) continue;
+                const auto found=!id.empty()?&*byId:namedArtist(current.artists,input.name);
                 Artist a;
                 if(found) a=*found;
-                else {a.name=name;a.fileName=name;}
+                else {a.name=input.name;a.fileName=input.name;}
                 if(!a.id.empty()&&savedArtists.contains(a.id)) continue;
-                if(names.size()==1&&!alias.empty()) a.aliases=alias;
-                const auto id=found&&(names.size()!=1||alias.empty()||alias==found->aliases)?a.id:db.saveArtist(a);
-                savedArtists.insert(id);
-                artists.push_back(id);
-                if(!found) {a.id=id;current.artists.push_back(std::move(a));}
+                if(inputs.size()==1&&!alias.empty()) a.aliases=alias;
+                const auto saved=found&&(inputs.size()!=1||alias.empty()||alias==found->aliases)?a.id:db.saveArtist(a);
+                savedArtists.insert(saved);
+                artists.push_back(saved);
+                if(!found) {a.id=saved;current.artists.push_back(std::move(a));}
+            }
+            std::vector<Artist> titleArtists;
+            for(const auto& id:artists) {
+                const auto found=std::ranges::find(current.artists,id,&Artist::id);
+                if(found!=current.artists.end()) titleArtists.push_back(*found);
             }
             LibraryId common=chosenId;
             if(mode==2&&common.empty()) throw LibraryError("Choose an existing artwork");
@@ -979,14 +1036,14 @@ struct RenameStudio::Impl {
                 const auto found=std::ranges::find(current.artworks,common,&Artwork::id);
                 if(found==current.artworks.end()) throw LibraryError("The selected artwork no longer exists");
                 auto chosenWork=*found;
-                if(!names.empty()) chosenWork.artists=artists;
-                if(!titleValue.empty()) chosenWork.title=titleValue;
+                if(!inputs.empty()) chosenWork.artists=artists;
+                if(!titleValue.empty()) {chosenWork.title=titleValue;chosenWork.userTitle.clear();}
                 if(firstNumber>0) chosenWork.number=firstNumber;
                 db.saveArtwork(chosenWork);
             }
             if(mode==1) {
                 Artwork a;
-                a.artists=artists;a.title=titleValue;
+                a.artists=artists;a.title=titleValue.empty()?inferOriginalTitle(selected.front().path.stem().wstring(),titleArtists):titleValue;
                 a.number=firstNumber?firstNumber:db.nextArtworkNumber(artists.empty()?LibraryId{}:artists.front());
                 common=db.saveArtwork(a);
             }
@@ -1008,7 +1065,7 @@ struct RenameStudio::Impl {
                     }
                 }
                 if(mode==0||(mode==3&&workId.empty())) {
-                    Artwork a;a.artists=artists;a.title=titleValue.empty()?file.path.stem().wstring():titleValue;
+                    Artwork a;a.artists=artists;a.title=titleValue.empty()?inferOriginalTitle(file.path.stem().wstring(),titleArtists):titleValue;
                     a.number=number?number++:db.nextArtworkNumber(artists.empty()?LibraryId{}:artists.front());
                     workId=db.saveArtwork(a);
                 }
@@ -1169,8 +1226,10 @@ struct RenameStudio::Impl {
         if(id==cancelTask&&notification==BN_CLICKED) {cancelJobs();return;}
         if((id==dbBackup||id==metaExport||id==metaImport)&&notification==BN_CLICKED&&postponeUi(id)) return;
         if(busy()) return;
+        if(id==artist&&notification==CBN_SELCHANGE) {selectArtist();return;}
         if((id==assignment&&notification==CBN_SELCHANGE)||(id==title&&notification==EN_CHANGE)||
-            (id==artist&&(notification==CBN_SELCHANGE||notification==CBN_EDITCHANGE))) {
+            (id==artist&&notification==CBN_EDITCHANGE)) {
+            if(id==artist) {selectedArtistId.clear();selectedArtistText.clear();}
             if(id==assignment) layout();
             updateExample();return;
         }
