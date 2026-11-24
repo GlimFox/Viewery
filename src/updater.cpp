@@ -20,7 +20,7 @@
 #include <vector>
 
 #ifndef VIEWERY_VERSION
-#define VIEWERY_VERSION "0.2.0-beta.8"
+#define VIEWERY_VERSION "0.2.0-beta.9"
 #endif
 
 namespace viewery {
@@ -281,6 +281,32 @@ std::wstring quoteArgument(std::wstring_view input)
     return output;
 }
 
+bool preparePortableUpdate(const std::wstring& version,std::stop_token stop,HANDLE& helper)
+{
+    const auto directory=runtime::executableDirectory();
+    const auto script=directory/L"Update-Portable.ps1";
+    const auto eventName=L"Local\\Viewery.Update."+std::to_wstring(GetCurrentProcessId())+L"."+std::to_wstring(GetTickCount64());
+    HANDLE ready=CreateEventW(nullptr,TRUE,FALSE,eventName.c_str());
+    if(!ready) return false;
+    wchar_t system[MAX_PATH]{};GetSystemDirectoryW(system,MAX_PATH);
+    const auto powershell=fs::path(system)/L"WindowsPowerShell/v1.0/powershell.exe";
+    auto command=quoteArgument(powershell.native())+L" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "+quoteArgument(script.native())+
+        L" -Version "+quoteArgument(version)+L" -Destination "+quoteArgument(directory.native())+L" -ParentPid "+std::to_wstring(GetCurrentProcessId())+L" -ReadyEvent "+quoteArgument(eventName);
+    STARTUPINFOW startup{sizeof(startup)};PROCESS_INFORMATION process{};
+    if(!CreateProcessW(powershell.c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,directory.c_str(),&startup,&process)) {CloseHandle(ready);return false;}
+    CloseHandle(process.hThread);
+    HANDLE handles[]{ready,process.hProcess};bool staged=false;
+    const auto deadline=std::chrono::steady_clock::now()+5min;
+    while(!stop.stop_requested()&&std::chrono::steady_clock::now()<deadline) {
+        const auto result=WaitForMultipleObjects(2,handles,FALSE,100);
+        if(result==WAIT_OBJECT_0) {staged=true;break;}
+        if(result!=WAIT_TIMEOUT) break;
+    }
+    if(!staged) {TerminateProcess(process.hProcess,ERROR_CANCELLED);WaitForSingleObject(process.hProcess,3000);}
+    if(staged) helper=process.hProcess;else CloseHandle(process.hProcess);
+    CloseHandle(ready);return staged;
+}
+
 bool runMediaInstaller(std::stop_token stop)
 {
     const auto script = runtime::executableDirectory() / L"Get-MediaTools.ps1";
@@ -328,6 +354,13 @@ UpdateService::UpdateService(HWND owner, UINT message) : owner_(owner), message_
 UpdateService::~UpdateService()
 {
     worker_.request_stop();
+    if(worker_.joinable()) worker_.join();
+    if(portableHelper_) CloseHandle(portableHelper_);
+}
+
+void UpdateService::cancelPreparedUpdate()
+{
+    if(portableHelper_) {TerminateProcess(portableHelper_,ERROR_CANCELLED);WaitForSingleObject(portableHelper_,3000);CloseHandle(portableHelper_);portableHelper_=nullptr;}
 }
 
 bool UpdateService::busy() const { return busy_.load(); }
@@ -387,7 +420,9 @@ bool UpdateService::check(bool manual)
                     }
                 }
                 if (!result.canInstall) {
-                    result.message += L". Автоустановка доступна для подписанной версии, установленной через App Installer.";
+                    if(!package&&fs::exists(runtime::executableDirectory()/L"Update-Portable.ps1")) {
+                        result.canInstall=true;result.message+=L". Можно скачать и установить обновление автоматически.";
+                    } else result.message+=L". Скачайте новую версию со страницы релиза.";
                 }
             }
         } catch(const std::invalid_argument&) {
@@ -415,20 +450,28 @@ bool UpdateService::install()
     std::wstring uri;
     {
         std::lock_guard guard(mutex_);
-        if (!result_.canInstall || !allowedInstallerUri(installerUri_)) return false;
+        if (!result_.canInstall) return false;
         uri = installerUri_;
+        if(uri.empty()) uri=L"portable:"+result_.version;
+        else if(!allowedInstallerUri(uri)) return false;
     }
     if (busy_.exchange(true)) return false;
     if (worker_.joinable()) worker_.join();
     {
         std::lock_guard guard(mutex_);
         result_.status = UpdateStatus::installing;
-        result_.message = L"Windows проверяет и устанавливает обновление…";
+        result_.message = L"Загрузка и проверка обновления…";
     }
     worker_ = std::jthread([this, uri](std::stop_token stop) {
         UpdateInfo result;
         result.manual = true;
         try {
+            if(uri.starts_with(L"portable:")) {
+                if(!preparePortableUpdate(uri.substr(9),stop,portableHelper_)) throw std::runtime_error("Portable update preparation failed");
+                result.status=UpdateStatus::portableReady;result.message=L"Обновление проверено. Перезапуск…";
+                if(!stop.stop_requested()) publish(std::move(result));else busy_=false;
+                return;
+            }
             Apartment apartment;
             PackageManager manager;
             auto operation = manager.RequestAddPackageByAppInstallerFileAsync(Uri(uri),
@@ -440,7 +483,9 @@ bool UpdateService::install()
             result.message = L"Обновление установлено. Перезапустите Viewery.";
         } catch (...) {
             result.status = UpdateStatus::failed;
-            result.message = L"Windows не установила обновление. Подпись или загрузка не прошли проверку. Текущая версия сохранена.";
+            result.message = uri.starts_with(L"portable:") ?
+                L"Не удалось подготовить обновление. Проверьте интернет и доступ к папке Viewery. Текущая версия сохранена." :
+                L"Windows не установила обновление. Подпись или загрузка не прошли проверку. Текущая версия сохранена.";
         }
         if (!stop.stop_requested()) publish(std::move(result));
         else busy_ = false;

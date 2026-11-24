@@ -64,7 +64,7 @@ try {
     foreach ($file in 'README.md','CHANGELOG.md','LICENSE','THIRD_PARTY.md') {
         Copy-Item -LiteralPath (Join-Path $repo $file) -Destination $payload
     }
-    foreach ($file in 'Get-MediaTools.ps1','Set-ExplorerIntegration.ps1') {
+    foreach ($file in 'Get-MediaTools.ps1','Set-ExplorerIntegration.ps1','Update-Portable.ps1') {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination $payload
     }
     [void] [IO.Directory]::CreateDirectory((Join-Path $payload 'licenses'))

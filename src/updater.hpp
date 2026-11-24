@@ -10,7 +10,7 @@
 namespace viewery {
 
 enum class UpdateStatus {
-    idle, checking, current, available, installing, mediaInstalling, mediaReady, failed, unsupported
+    idle, checking, current, available, installing, mediaInstalling, mediaReady, failed, unsupported, portableReady
 };
 
 struct UpdateInfo {
@@ -33,6 +33,7 @@ public:
     bool check(bool manual = false);
     // The caller obtains user confirmation and waits for conversion/rename tasks to finish.
     bool install();
+    void cancelPreparedUpdate();
     bool installMediaTools();
     bool busy() const;
     UpdateInfo take() const;
@@ -50,6 +51,7 @@ private:
     std::wstring installerUri_;
     std::atomic_bool busy_ = false;
     std::jthread worker_;
+    HANDLE portableHelper_=nullptr;
 };
 
 }

@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.25)
 project(Viewery VERSION 0.2.0 LANGUAGES CXX)
-set(VIEWERY_VERSION "0.2.0-beta.8" CACHE STRING "Semantic version published by Viewery")
+set(VIEWERY_VERSION "0.2.0-beta.9" CACHE STRING "Semantic version published by Viewery")
 if(NOT VIEWERY_VERSION MATCHES "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-beta\\.([1-9][0-9]*))?$")
-    message(FATAL_ERROR "Invalid VIEWERY_VERSION '${VIEWERY_VERSION}'. Expected major.minor.patch or major.minor.patch-beta.N. In PowerShell, quote the entire argument: \"-DVIEWERY_VERSION=0.2.0-beta.8\".")
+    message(FATAL_ERROR "Invalid VIEWERY_VERSION '${VIEWERY_VERSION}'. Expected major.minor.patch or major.minor.patch-beta.N. In PowerShell, quote the entire argument: \"-DVIEWERY_VERSION=0.2.0-beta.9\".")
 endif()
 set(viewery_version_components "${CMAKE_MATCH_1}" "${CMAKE_MATCH_2}" "${CMAKE_MATCH_3}")
 if(NOT "${CMAKE_MATCH_5}" STREQUAL "")
@@ -48,6 +48,8 @@ target_link_libraries(Viewery PRIVATE advapi32 comctl32 dwmapi gdi32 msimg32 ole
     shell32 shlwapi user32 uuid windowscodecs bcrypt winhttp windowsapp runtimeobject uxtheme)
 add_custom_command(TARGET Viewery POST_BUILD COMMAND "${CMAKE_COMMAND}" -E copy_if_different
     "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Get-MediaTools.ps1" "$<TARGET_FILE_DIR:Viewery>/Get-MediaTools.ps1")
+add_custom_command(TARGET Viewery POST_BUILD COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Update-Portable.ps1" "$<TARGET_FILE_DIR:Viewery>/Update-Portable.ps1")
 
 add_library(VieweryShell SHARED src/shell_command.cpp)
 viewery_target(VieweryShell)
@@ -57,6 +59,12 @@ set_target_properties(VieweryShell PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 include(CTest)
+if(BUILD_TESTING)
+    find_program(VIEWERY_TEST_POWERSHELL NAMES powershell pwsh REQUIRED)
+    add_test(NAME portable-update COMMAND "${VIEWERY_TEST_POWERSHELL}" -NoProfile -ExecutionPolicy Bypass -File
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/portable_update_smoke.ps1" -OutputDirectory "${CMAKE_BINARY_DIR}/portable-update-tests")
+    set_tests_properties(portable-update PROPERTIES TIMEOUT 120)
+endif()
 if(BUILD_TESTING)
     add_executable(viewery-library-tests tests/library_smoke.cpp src/library.cpp)
     viewery_target(viewery-library-tests)

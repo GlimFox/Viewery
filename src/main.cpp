@@ -64,7 +64,7 @@ constexpr UINT refreshTimer = 1;
 constexpr UINT canvasClickTimer = 2;
 constexpr UINT filenameTimer = 3;
 #ifndef VIEWERY_VERSION
-#define VIEWERY_VERSION "0.2.0-beta.8"
+#define VIEWERY_VERSION "0.2.0-beta.9"
 #endif
 
 constexpr COLORREF background = RGB(14, 16, 21);
@@ -2532,6 +2532,12 @@ void App::navigateGroup(int direction)
 void App::acceptUpdate()
 {
     updateInfo_=updates_->take();
+    if(updateInfo_.status==UpdateStatus::portableReady) {
+        if(exportThread_.joinable()||(studio_&&(studio_->busy()||studio_->queuedFileCount()))||(artists_&&artists_->busy())) {
+            updates_->cancelPreparedUpdate();
+            updateInfo_.status=UpdateStatus::failed;updateInfo_.message=L"Обновление отложено: завершите обработку файлов и повторите установку.";
+        } else {PostQuitMessage(0);return;}
+    }
     if(settings_) settings_->update(settingsState());
     if(updateInfo_.status==UpdateStatus::mediaReady&&window_&&!path_.empty()) {
         const auto file=path_;player_.reset();openMedia(file);
@@ -2917,7 +2923,7 @@ void App::command(UINT id)
         if(exportThread_.joinable()||(studio_&&studio_->busy())||(artists_&&artists_->busy())) {
             MessageBoxW(window_,L"Завершите экспорт или обработку коллекции перед обновлением.",L"Обновление",MB_OK);return;
         }
-        if(MessageBoxW(window_?window_:controller_,L"Установить обновление Viewery? Приложение будет закрыто для обновления. После установки запустите его снова.",
+        if(MessageBoxW(window_?window_:controller_,L"Скачать и установить обновление Viewery? После проверки загрузки приложение будет закрыто. Portable-версия перезапустится автоматически.",
                        L"Обновление",MB_YESNO|MB_ICONQUESTION)==IDYES&&updates_) updates_->install();
         return;
     case static_cast<UINT>(Control::catalog):
