@@ -489,6 +489,117 @@ void checkQueuedCycleUndo(HWND host,HFONT font,const fs::path& folder) {
     studio.hide();
 }
 
+struct NativeArtistChoice {
+    HWND combo=nullptr;
+    unsigned changes=0;
+    std::wstring textAtChange;
+};
+LRESULT CALLBACK observeNativeArtistChoice(HWND window,UINT message,WPARAM wparam,LPARAM lparam,UINT_PTR,DWORD_PTR value) {
+    auto& observed=*reinterpret_cast<NativeArtistChoice*>(value);
+    if(message==WM_COMMAND&&reinterpret_cast<HWND>(lparam)==observed.combo&&HIWORD(wparam)==CBN_SELCHANGE) {
+        ++observed.changes;observed.textAtChange=text(observed.combo);
+    }
+    return DefSubclassProc(window,message,wparam,lparam);
+}
+void checkNativeArtistDropdown(HWND host,HFONT font,const fs::path& folder) {
+    const auto database=folder/L"native-artist-choice.sqlite3",source=folder/L"glimfox_001_v01_aaa.png";
+    {std::ofstream output(source,std::ios::binary);output<<"native dropdown source";}
+    CollectionStore registry(database);
+    Artist alpha;alpha.name=L"Alpha Display";alpha.fileName=L"Худ1";alpha.id=registry.saveArtist(alpha);
+    Artist fox;fox.name=L"glimfox";fox.fileName=L"fox-token";fox.id=registry.saveArtist(fox);
+    auto file=registry.indexFiles({source}).front();
+    Artwork old;old.artists={alpha.id};old.number=6;old.title=L"Stored Old Title";old.userTitle=L"Stored Old Override";
+    old.id=registry.saveArtwork(old);file.artworkId=old.id;registry.saveFile(file);
+    RenameStudio studio(host,changed,[]{},database);
+    RECT area{};GetClientRect(host,&area);studio.show(area,96,font);studio.setFiles({source},{source});
+    require(wait([&]{return !studio.busy();}),"Native artist selection fixture loads distinct display names and filename tokens");
+    const auto pane=studio.window(),choice=control(pane,1006);
+    const auto editorPane=templatePane(studio);
+    SendMessageW(control(editorPane,1021),LB_SETCURSEL,0,0);notify(editorPane,1021,LBN_SELCHANGE);
+    SetWindowTextW(control(editorPane,1029),L"Custom-");click(editorPane,1033);click(editorPane,1041);pump();
+    const auto alphaRow=SendMessageW(choice,CB_FINDSTRINGEXACT,static_cast<WPARAM>(-1),reinterpret_cast<LPARAM>(alpha.name.c_str()));
+    const auto foxRow=SendMessageW(choice,CB_FINDSTRINGEXACT,static_cast<WPARAM>(-1),reinterpret_cast<LPARAM>(fox.name.c_str()));
+    require(alphaRow>=0&&foxRow==alphaRow+1,"Native dropdown fixture has two adjacent registered artist choices");
+    SendMessageW(choice,CB_SETCURSEL,alphaRow,0);notify(pane,1006,CBN_SELCHANGE);
+    NativeArtistChoice observed{choice};
+    require(SetWindowSubclass(GetParent(choice),observeNativeArtistChoice,91,reinterpret_cast<DWORD_PTR>(&observed))!=FALSE,
+        "Native artist notifications can be observed before Studio handles them");
+    SendMessageW(choice,WM_KEYDOWN,VK_DOWN,0);SendMessageW(choice,WM_KEYUP,VK_DOWN,0);
+    RemoveWindowSubclass(GetParent(choice),observeNativeArtistChoice,91);
+    require(observed.changes>0&&SendMessageW(choice,CB_GETCURSEL,0,0)==foxRow&&text(choice)==fox.name,
+        "A real native keyboard selection commits the second artist through CBN_SELCHANGE");
+    std::wcout<<L"Native artist notification edit text: "<<observed.textAtChange<<L" -> "<<text(choice)<<L'\n';
+    const auto draft=text(control(pane,liveExample));
+    require(draft==L"Custom-fox-token_001_v01_aaa.png",
+        "Live example uses the newly selected artist ID and its filename token before native edit text commits");
+    click(pane,1041);
+    require(wait([&]{return !studio.busy()&&studio.queuedFileCount()==1;})&&queueNames(pane).front().second==draft,
+        "Immediately approving a native artist choice freezes the exact filename shown in its live example");
+    const auto saved=std::ranges::find(studio.snapshot().files,file.id,&MediaRecord::id);
+    require(saved!=studio.snapshot().files.end(),"Approved native dropdown source retains its original media identity");
+    const auto assigned=std::ranges::find(studio.snapshot().artworks,saved->artworkId,&Artwork::id);
+    require(assigned!=studio.snapshot().artworks.end()&&assigned->artists==std::vector<LibraryId>{fox.id}&&assigned->title==L"aaa",
+        "Native dropdown assignment keeps the exact registered ID and strips only an implicit formatted source prefix");
+
+    SendMessageW(control(pane,1009),CB_SETCURSEL,2,0);notify(pane,1009,CBN_SELCHANGE);
+    const auto existingLabel=std::to_wstring(old.number)+L" · "+old.title;
+    const auto existingRow=SendMessageW(control(pane,1008),CB_FINDSTRINGEXACT,static_cast<WPARAM>(-1),reinterpret_cast<LPARAM>(existingLabel.c_str()));
+    require(existingRow>=0,"An existing artwork with an independent stored user title can be selected");
+    SendMessageW(control(pane,1008),CB_SETCURSEL,existingRow,0);notify(pane,1008,CBN_SELCHANGE);
+    SetWindowTextW(choice,alpha.name.c_str());notify(pane,1006,CBN_EDITCHANGE);
+    SetWindowTextW(control(pane,1007),L"glimfox_009_v04_Existing Manual");
+    const auto existingManual=text(control(pane,liveExample));
+    require(existingManual==L"Custom-Худ1_006_v01_glimfox_009_v04_Existing Manual.png",
+        "An explicit title overrides the existing artwork's stored user title in the live example");
+    click(pane,1041);require(wait([&]{return !studio.busy();})&&queueNames(pane).front().second==existingManual,
+        "Existing-work assignment queues the exact manual title displayed in its live example");
+    const auto changedWork=std::ranges::find(studio.snapshot().artworks,old.id,&Artwork::id);
+    require(changedWork!=studio.snapshot().artworks.end()&&changedWork->title==L"glimfox_009_v04_Existing Manual"&&changedWork->userTitle.empty(),
+        "Saving an explicit existing-work title clears the previous user-title override");
+    SendMessageW(control(pane,1009),CB_SETCURSEL,0,0);notify(pane,1009,CBN_SELCHANGE);
+
+    SetWindowTextW(choice,alpha.name.c_str());notify(pane,1006,CBN_EDITCHANGE);
+    SetWindowTextW(control(pane,1007),L"glimfox_007_v03_Manual");
+    const auto manual=text(control(pane,liveExample));
+    require(manual==L"Custom-Худ1_007_v01_glimfox_007_v03_Manual.png",
+        "Typing another artist clears the dropdown binding while preserving explicit manual title and current template");
+    click(pane,1041);require(wait([&]{return !studio.busy();})&&queueNames(pane).front().second==manual,
+        "Typed artist edits produce the same approved filename as their live example");
+
+    const auto other=folder/L"glimfox_bbb.png";
+    {std::ofstream output(other,std::ios::binary);output<<"second shared-work source";}
+    studio.setFiles({source,other},{source,other});require(wait([&]{return !studio.busy();}),"Two differently named sources are prepared for one shared artwork");
+    SendMessageW(control(pane,1009),CB_SETCURSEL,1,0);notify(pane,1009,CBN_SELCHANGE);
+    SendMessageW(choice,CB_SETCURSEL,alphaRow,0);notify(pane,1006,CBN_SELCHANGE);
+    SendMessageW(choice,WM_KEYDOWN,VK_DOWN,0);SendMessageW(choice,WM_KEYUP,VK_DOWN,0);
+    const auto shared=text(control(pane,liveExample));click(pane,1041);
+    require(wait([&]{return !studio.busy();})&&studio.queuedFileCount()==2&&queueNames(pane).front().second==shared&&
+        std::ranges::all_of(queueNames(pane),[](const auto& row){return row.second.ends_with(L"_aaa.png");}),
+        "A blank shared-work title uses the same inferred first-source title in preview and actual batch");
+
+    const auto custom=templatePane(studio);
+    while(SendMessageW(control(custom,1021),LB_GETCOUNT,0,0)>0) {
+        SendMessageW(control(custom,1021),LB_SETCURSEL,0,0);click(custom,1024);
+    }
+    SendMessageW(control(custom,1022),CB_SETCURSEL,static_cast<WPARAM>(NameBlockKind::original),0);click(custom,1023);click(custom,1041);pump();
+    const auto intentional=text(control(pane,liveExample));
+    require(intentional==source.filename().wstring(),"A custom Original block intentionally keeps the complete original filename");
+    click(pane,1041);require(wait([&]{return !studio.busy();})&&queueNames(pane).front().second==intentional&&
+        std::ranges::all_of(queueNames(pane),[](const auto& row){return row.first==row.second;}),
+        "Smart implicit titles do not strip custom Original template output");
+    const auto unlinked=folder/L"glimfox_ccc.png";
+    {std::ofstream output(unlinked,std::ios::binary);output<<"unlinked artist-only source";}
+    studio.setFiles({source,other,unlinked},{unlinked});require(wait([&]{return !studio.busy();}),"A source without an existing artwork can enter artist-only assignment");
+    SendMessageW(control(pane,1009),CB_SETCURSEL,3,0);notify(pane,1009,CBN_SELCHANGE);click(pane,1041);
+    require(wait([&]{return !studio.busy();}),"Artist-only assignment prepares the previously unlinked source");
+    const auto newFile=std::ranges::find(studio.snapshot().files,unlinked,&MediaRecord::path);
+    require(newFile!=studio.snapshot().files.end(),"Artist-only batch retains the unlinked source identity");
+    const auto newWork=std::ranges::find(studio.snapshot().artworks,newFile->artworkId,&Artwork::id);
+    require(newWork!=studio.snapshot().artworks.end()&&newWork->title==L"ccc"&&newWork->artists==std::vector<LibraryId>{fox.id},
+        "Artist-only assignment infers a clean title only when the source has no existing artwork");
+    studio.hide();
+}
+
 void checkBatchEventsAndArtistButton(HWND host,HFONT font,const fs::path& folder) {
     const auto source=folder/L"batch-event.png",database=folder/L"batch-events.sqlite3";
     {std::ofstream output(source,std::ios::binary);output<<"batch notification bytes";}
@@ -541,6 +652,42 @@ void checkBatchEventsAndArtistButton(HWND host,HFONT font,const fs::path& folder
     studio.hide();
 }
 
+void checkArtistOnlyVersionPreview(HWND host,HFONT font,const fs::path& folder) {
+    const auto fresh=folder/L"Artist_Fresh.png",linkless=folder/L"Artist_Linkless.png",database=folder/L"artist-only-versions.sqlite3";
+    {std::ofstream output(fresh,std::ios::binary);output<<"unlinked version source";}
+    {std::ofstream output(linkless,std::ios::binary);output<<"existing artwork without a linked version";}
+    CollectionStore registry(database);
+    Artist artist;artist.name=L"Version Artist";artist.fileName=L"Artist";artist.id=registry.saveArtist(artist);
+    auto files=registry.indexFiles({fresh,linkless});
+    Artwork work;work.artists={artist.id};work.number=7;work.title=L"Existing Work";work.id=registry.saveArtwork(work);
+    for(const auto number:{2LL,7LL}) {MediaVersion version;version.artworkId=work.id;version.number=number;registry.saveVersion(version);}
+    files[1].artworkId=work.id;registry.saveFile(files[1]);
+    RenameStudio studio(host,changed,[]{},database);RECT area{};GetClientRect(host,&area);studio.show(area,96,font);
+    studio.setFiles({fresh,linkless},{fresh});require(wait([&]{return !studio.busy();}),"Artist-only version fixture loads unlinked and linkless sources");
+    const auto pane=studio.window();SetWindowTextW(control(pane,1006),artist.name.c_str());notify(pane,1006,CBN_EDITCHANGE);
+    SendMessageW(control(pane,1009),CB_SETCURSEL,3,0);notify(pane,1009,CBN_SELCHANGE);
+    SetWindowTextW(control(pane,1011),L"5");notify(pane,1006,CBN_EDITCHANGE);
+    const auto newWorkPreview=text(control(pane,liveExample));
+    require(newWorkPreview.ends_with(L"_v01_Fresh.png"),"Artist-only preview starts an unlinked artwork at v01 despite a first-version input of five");
+    click(pane,1041);require(wait([&]{return !studio.busy();})&&queueNames(pane).front().second==newWorkPreview,
+        "Unlinked artist-only batch queues the exact v01 filename shown in its preview");
+    studio.setFiles({fresh,linkless},{linkless});SetWindowTextW(control(pane,1007),L"Do Not Replace Existing Title");
+    const auto nextPreview=text(control(pane,liveExample));
+    require(nextPreview==L"Artist_007_v08_Existing Work.png",
+        "Artist-only preview finds the existing artwork's next version when the file has no linked version");
+    click(pane,1041);require(wait([&]{return !studio.busy();})&&std::ranges::any_of(queueNames(pane),[&](const auto& row){
+        return row.first==linkless.filename().wstring()&&row.second==nextPreview;
+    }),"Linkless existing-artwork batch queues the exact next-version filename shown in preview");
+    MediaVersion later;later.artworkId=work.id;later.number=11;registry.saveVersion(later);studio.refreshCollection();
+    require(wait([&]{return !studio.busy();}),"A later unrelated version can be loaded without replacing a linked version");
+    SetWindowTextW(control(pane,1011),L"3");notify(pane,1006,CBN_EDITCHANGE);
+    require(text(control(pane,liveExample))==nextPreview,"Artist-only preview preserves the file's valid linked version despite a different input and newer versions");
+    click(pane,1041);require(wait([&]{return !studio.busy();})&&std::ranges::any_of(queueNames(pane),[&](const auto& row){
+        return row.first==linkless.filename().wstring()&&row.second==nextPreview;
+    }),"Artist-only reapproval preserves the linked version in both preview and queue");
+    studio.hide();
+}
+
 int wmain(int argc,wchar_t** argv) {
     if(argc!=2) return 2;
     const fs::path folder=fs::absolute(argv[1])/(L"run-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
@@ -566,7 +713,9 @@ int wmain(int argc,wchar_t** argv) {
             CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,0,L"Segoe UI");
         checkArtistRegistryRefresh(host,font,folder);
         checkQueuedCycleUndo(host,font,folder);
+        checkNativeArtistDropdown(host,font,folder);
         checkBatchEventsAndArtistButton(host,font,folder);
+        checkArtistOnlyVersionPreview(host,font,folder);
         const auto one=folder/L"first/imageA01.png",two=folder/L"first/imageA02.png",keep=folder/L"first/keep.png";
         const auto three=folder/L"second/imageB01.png",four=folder/L"second/imageB02.png";
         {std::ofstream f(one,std::ios::binary);f<<"first bytes";}{std::ofstream f(two,std::ios::binary);f<<"second bytes";}

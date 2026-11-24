@@ -247,7 +247,105 @@ std::wstring getText(const Json& object, const char* key, std::wstring_view fall
     return result;
 }
 
+bool titleSeparator(wchar_t character)
+{
+    return character==L'_'||character==L'-'||std::iswspace(character)!=0;
+}
+
+bool artistPrefixBoundary(wchar_t character)
+{
+    return titleSeparator(character)||character==L'&'||character==L'+';
+}
+
+std::wstring trimmedArtistToken(std::wstring_view token)
+{
+    while(!token.empty()&&std::iswspace(token.front())) token.remove_prefix(1);
+    while(!token.empty()&&std::iswspace(token.back())) token.remove_suffix(1);
+    return std::wstring(token);
+}
+
+std::vector<std::wstring> titleArtistTokens(const std::vector<Artist>& artists)
+{
+    std::vector<std::wstring> tokens;
+    const auto add=[&](std::wstring_view text) {
+        const auto token=trimmedArtistToken(text);
+        if(token.empty()) return;
+        for(const auto& spelling:{token,sanitizeWindowsName(token)}) {
+            tokens.push_back(spelling);
+            tokens.push_back(L"["+spelling+L"]");
+        }
+    };
+    for(const auto& artist:artists) {
+        add(artist.name);add(artist.fileName);
+        std::size_t start=0;
+        while(start<artist.aliases.size()) {
+            const auto end=artist.aliases.find_first_of(L",;\r\n",start);
+            add(std::wstring_view(artist.aliases).substr(start,end==std::wstring::npos?end:end-start));
+            if(end==std::wstring::npos) break;
+            start=end+1;
+        }
+    }
+    std::ranges::sort(tokens,[](const auto& a,const auto& b){return a.size()>b.size();});
+    return tokens;
+}
+
+std::size_t selectedArtistPrefix(std::wstring_view stem,std::size_t at,
+                                 const std::vector<std::wstring>& tokens)
+{
+    for(const auto& token:tokens) {
+        if(token.size()>stem.size()-at) continue;
+        const auto end=at+token.size();
+        if(end<stem.size()&&!artistPrefixBoundary(stem[end])) continue;
+        if(CompareStringOrdinal(stem.data()+at,static_cast<int>(token.size()),
+            token.data(),static_cast<int>(token.size()),TRUE)==CSTR_EQUAL) return end;
+    }
+    return at;
+}
+
+std::size_t positiveNumberEnd(std::wstring_view stem,std::size_t at)
+{
+    const auto start=at;
+    bool positive=false;
+    while(at<stem.size()&&stem[at]>=L'0'&&stem[at]<=L'9') {
+        positive|=stem[at]!=L'0';++at;
+    }
+    return positive&&at-start<=18?at:start;
+}
+
 } // namespace
+
+std::wstring inferOriginalTitle(std::wstring_view sourceStem,const std::vector<Artist>& selectedArtists)
+{
+    const auto tokens=titleArtistTokens(selectedArtists);
+    auto end=selectedArtistPrefix(sourceStem,0,tokens);
+    if(end==0) return std::wstring(sourceStem);
+    // Remove joined author prefixes only when every name is selected. Keeping
+    // an unknown coauthor preserves information instead of guessing its role.
+    for(;;) {
+        auto join=end;
+        while(join<sourceStem.size()&&std::iswspace(sourceStem[join])) ++join;
+        if(join==sourceStem.size()||(sourceStem[join]!=L'&'&&sourceStem[join]!=L'+')) break;
+        ++join;
+        while(join<sourceStem.size()&&std::iswspace(sourceStem[join])) ++join;
+        const auto next=selectedArtistPrefix(sourceStem,join,tokens);
+        if(next==join) return std::wstring(sourceStem);
+        end=next;
+    }
+    while(end<sourceStem.size()&&titleSeparator(sourceStem[end])) ++end;
+    const auto titleStart=end;
+    const auto workEnd=positiveNumberEnd(sourceStem,end);
+    if(workEnd>end&&workEnd+2<sourceStem.size()&&sourceStem[workEnd]==L'_'&&
+       (sourceStem[workEnd+1]==L'v'||sourceStem[workEnd+1]==L'V')) {
+        const auto versionStart=workEnd+2;
+        const auto versionEnd=positiveNumberEnd(sourceStem,versionStart);
+        if(versionEnd>versionStart&&(versionEnd==sourceStem.size()||sourceStem[versionEnd]==L'_')) {
+            end=versionEnd;
+            while(end<sourceStem.size()&&titleSeparator(sourceStem[end])) ++end;
+            return std::wstring(sourceStem.substr(end));
+        }
+    }
+    return std::wstring(sourceStem.substr(titleStart));
+}
 
 RenameTemplate defaultArtistTemplate()
 {
