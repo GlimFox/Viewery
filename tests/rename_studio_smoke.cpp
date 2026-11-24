@@ -402,7 +402,25 @@ int wmain(int argc,wchar_t** argv) {
         auto studio=std::make_unique<RenameStudio>(host,changed,[&]{++beforeChanges;},folder/L"collection.sqlite3");
         RECT area{};GetClientRect(host,&area);studio->show(area,96,font);
         studio->setFiles({one,two,keep},{one,two});
-        require(wait([&]{return !studio->busy()&&studio->snapshot().files.size()==3;}),"Studio indexes its explicit isolated database");
+        require(studio->busy(),"Initial metadata indexing starts asynchronously");
+        studio->openTemplates();
+        require(!studio->templatesWindow(),"A template request during initial indexing is deferred");
+        require(wait([&]{return !studio->busy()&&studio->snapshot().files.size()==3&&
+            studio->templatesWindow()&&IsWindowVisible(studio->templatesWindow());}),
+            "The first template click opens automatically when indexing finishes without a second click");
+        unsigned editorWindows=0;
+        EnumThreadWindows(GetCurrentThreadId(),[](HWND window,LPARAM parameter)->BOOL {
+            wchar_t name[80]{};GetClassNameW(window,name,static_cast<int>(std::size(name)));
+            if(std::wstring_view(name)==L"Viewery.TemplateEditor.1") ++*reinterpret_cast<unsigned*>(parameter);
+            return TRUE;
+        },reinterpret_cast<LPARAM>(&editorWindows));
+        require(editorWindows==1,"A deferred request creates exactly one owned template window");
+        SendMessageW(studio->templatesWindow(),WM_CLOSE,0,0);pump();
+        studio->setFiles({three,four},{three,four});studio->openTemplates();studio->cancel();
+        require(wait([&]{return !studio->busy();})&&!IsWindowVisible(studio->templatesWindow()),
+            "Cancel clears a deferred template request instead of reopening the window later");
+        studio->setFiles({one,two,keep},{one,two});
+        require(wait([&]{return !studio->busy();}),"A new selection resumes normal indexing after cancellation");
         RedrawWindow(studio->window(),nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN|RDW_UPDATENOW);
         for(int iteration=0;iteration<20;++iteration) studio->show(area,96,font);
         require(!GetUpdateRect(studio->window(),nullptr,FALSE)&&!GetUpdateRect(control(studio->window(),1055),nullptr,FALSE),

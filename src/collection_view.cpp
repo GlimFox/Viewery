@@ -96,8 +96,11 @@ std::wstring artistFromName(const std::filesystem::path& path)
     })) return {};
     const auto key=folded(name);
     static const std::set<std::wstring> generic{L"IMAGE",L"IMG",L"PHOTO",L"PICTURE",L"SCREENSHOT",L"SCREEN",L"FRAME",
-        L"CAPTURE",L"VIDEO",L"DSC",L"PIC",L"CANVAS",L"UNTITLED",L"DOWNLOAD",L"ФОТО",L"СКРИНШОТ"};
-    return generic.contains(key)?std::wstring{}:name;
+        L"CAPTURE",L"VIDEO",L"VID",L"PXL",L"DSC",L"PIC",L"CANVAS",L"UNTITLED",L"DOWNLOAD",L"ФОТО",L"СКРИНШОТ"};
+    if(generic.contains(key)||key.starts_with(L"CODEX-CLIPBOARD")) return {};
+    for(const auto& prefix:generic) if(key.starts_with(prefix)&&key.size()>prefix.size()&&
+        std::ranges::all_of(std::wstring_view(key).substr(prefix.size()),[](wchar_t ch){return ch>=L'0'&&ch<=L'9';})) return {};
+    return name;
 }
 
 std::int64_t customOrder(const MediaRecord* file, std::size_t ordinal)

@@ -22,6 +22,7 @@ namespace {
 namespace fs = std::filesystem;
 constexpr UINT finished = WM_APP + 431;
 constexpr UINT validateQueueMessage = WM_APP + 432;
+constexpr UINT deferredUiMessage = WM_APP + 433;
 constexpr COLORREF bg = RGB(23,26,33), fg = RGB(241,242,247), muted = RGB(149,155,170);
 constexpr COLORREF accent = RGB(155,140,255), inputColor = RGB(36,40,52);
 enum Id {
@@ -123,6 +124,8 @@ struct RenameStudio::Impl {
     POINT dragOrigin{};
     bool filling=false,indexPending=false,layingOut=false,dragging=false,advanced=false;
     bool templateOnly=false,dataExpanded=false;
+    int deferredUiAction=0;
+    bool deferredUiPosted=false;
     Impl* templateParent=nullptr;
     std::unique_ptr<Impl> editor;
     HFONT editorFont=nullptr;
@@ -296,7 +299,24 @@ struct RenameStudio::Impl {
         }
         return false;
     }
-    void close() { PostMessageW(owner,WM_COMMAND,RenameStudio::closeCommandId,0); }
+    void close() {deferredUiAction=0;PostMessageW(owner,WM_COMMAND,RenameStudio::closeCommandId,0);}
+    void scheduleDeferredUi() {
+        if(deferredUiAction&&!deferredUiPosted&&!busy()&&!indexPending&&directory==indexed) {
+            deferredUiPosted=PostMessageW(window,deferredUiMessage,0,0)!=FALSE;
+        }
+    }
+    bool postponeUi(int action) {
+        if(!busy()&&!indexPending&&directory==indexed) return false;
+        deferredUiAction=action;
+        SetWindowTextW(c(status),L"Откроется после подготовки коллекции…");
+        if(!busy()) beginIndex();
+        return true;
+    }
+    void cancelJobs() {
+        deferredUiAction=0;worker.request_stop();
+        if(templateParent) templateParent->deferredUiAction=0;
+        if(editor) {editor->deferredUiAction=0;editor->worker.request_stop();}
+    }
     static LRESULT CALLBACK editorProcedure(HWND hwnd,UINT msg,WPARAM w,LPARAM l) {
         auto* self=reinterpret_cast<Impl*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));
         if(msg==WM_NCCREATE) {
@@ -318,6 +338,7 @@ struct RenameStudio::Impl {
             return 0;
         }
         if(msg==WM_CLOSE||(msg==WM_COMMAND&&LOWORD(w)==RenameStudio::closeCommandId)) {
+            if(self->deferredUiAction==tabTemplate) self->deferredUiAction=0;
             ShowWindow(hwnd,SW_HIDE);return 0;
         }
         if(msg==self->changed&&self->editor) {
@@ -325,6 +346,7 @@ struct RenameStudio::Impl {
             self->layout();
             PostMessageW(self->owner,self->changed,0,0);
             if(self->indexPending&&!self->busy()) self->beginIndex();
+            self->scheduleDeferredUi();
             return 0;
         }
         return DefWindowProcW(hwnd,msg,w,l);
@@ -370,7 +392,7 @@ struct RenameStudio::Impl {
         updateExample();
     }
     void openEditor() {
-        if(templateOnly||busy()) return;
+        if(templateOnly||postponeUi(tabTemplate)) return;
         if(!editorHost) {
             static const ATOM klass=[] {
                 WNDCLASSW wc{};wc.hInstance=GetModuleHandleW(nullptr);wc.lpfnWndProc=editorProcedure;
@@ -645,7 +667,8 @@ struct RenameStudio::Impl {
         if(editor&&!editor->busy()) {editor->data=data;editor->presets=presets;editor->selection=selection;editor->fillMetadata();editor->fillPresets();editor->updateExample();}
         PostMessageW(owner,changed,0,0);
         layout();
-        if(!cancelled&&(indexPending||directory!=indexed)) beginIndex();
+        if((!cancelled||deferredUiAction)&&(indexPending||directory!=indexed)) beginIndex();
+        scheduleDeferredUi();
     }
     void updateSelection(std::vector<fs::path> selected) {
         ++selectionGeneration;
@@ -1048,9 +1071,8 @@ struct RenameStudio::Impl {
             layout();return;
         }
         if(id==previewSearch&&notification==EN_CHANGE) {fillPreview();return;}
-        if(id==cancelTask&&notification==BN_CLICKED) {
-            worker.request_stop();if(editor) editor->worker.request_stop();return;
-        }
+        if(id==cancelTask&&notification==BN_CLICKED) {cancelJobs();return;}
+        if((id==dbBackup||id==metaExport||id==metaImport)&&notification==BN_CLICKED&&postponeUi(id)) return;
         if(busy()) return;
         if((id==assignment&&notification==CBN_SELCHANGE)||(id==title&&notification==EN_CHANGE)||
             (id==artist&&(notification==CBN_SELCHANGE||notification==CBN_EDITCHANGE))) {
@@ -1281,6 +1303,13 @@ struct RenameStudio::Impl {
             case WM_KEYDOWN:if(w==VK_ESCAPE) {close();return 0;}break;
             case finished:finishJob();return 0;
             case validateQueueMessage:if(!busy()) revalidateQueue();return 0;
+            case deferredUiMessage:
+                deferredUiPosted=false;
+                if(deferredUiAction&&!busy()&&!indexPending&&directory==indexed) {
+                    const int action=std::exchange(deferredUiAction,0);
+                    command(action,BN_CLICKED);
+                }
+                return 0;
             case WM_COMMAND:command(LOWORD(w),HIWORD(w));return 0;
             case WM_ERASEBKGND: {
                 RECT client{};GetClientRect(hwnd,&client);fill(reinterpret_cast<HDC>(w),client,bg);return 1;
@@ -1444,7 +1473,7 @@ void RenameStudio::collectionAction(CollectionAction action) {
 }
 std::size_t RenameStudio::queuedFileCount() const {return impl_->preview.size();}
 bool RenameStudio::busy() const {return impl_->busy();}
-void RenameStudio::cancel() {impl_->worker.request_stop();if(impl_->editor) impl_->editor->worker.request_stop();}
+void RenameStudio::cancel() {impl_->cancelJobs();}
 void RenameStudio::setFiles(std::vector<fs::path> directory,std::vector<fs::path> selected) {
     const bool changed=directory!=impl_->directory;
     if(changed) {

@@ -160,17 +160,18 @@ void checkNamesWithoutMetadata()
     const std::vector<std::filesystem::path> paths{
         L"C:\\media\\Худ2_001_v01_Название.png",L"C:\\media\\Худ1_002_v01_Рассвет.png",
         L"C:\\media\\nekoxl-100601298-2740294027.png",L"C:\\media\\[Artist A] First Light.jpg",
-        L"C:\\media\\image-05-07.png",L"C:\\media\\randomhash12345.jpg"};
+        L"C:\\media\\image-05-07.png",L"C:\\media\\randomhash12345.jpg",
+        L"C:\\media\\IMG20261113_151242.jpg",L"C:\\media\\codex-clipboard-f261227a-99c2-410b.png"};
     CollectionViewOptions options;options.group=CollectionGroup::artist;options.sort=CollectionSort::artist;
     const auto grouped=buildCollectionView(snapshot,paths,options);
-    expect(grouped.fileCount==6&&leafNames(grouped).size()==6&&grouped.artistCount==4,
+    expect(grouped.fileCount==8&&leafNames(grouped).size()==8&&grouped.artistCount==4,
         "Artist groups infer common filename patterns and keep all unrecognized files");
     expect(groupFor(grouped,L"Худ1")&&groupFor(grouped,L"nekoxl")&&groupFor(grouped,L"Без художника"),
         "Unicode, social-export prefixes and unknown artist group are displayed");
     options.filter.artist=L"Худ1";
     expect(buildCollectionView(snapshot,paths,options).fileCount==1,"Artist filter includes filenames without stored metadata");
     options={};
-    expect(buildCollectionView(snapshot,paths,options).fileCount==6,"All files restores the full folder independently of metadata");
+    expect(buildCollectionView(snapshot,paths,options).fileCount==8,"All files restores the full folder independently of metadata");
     expect(snapshot.artists.empty()&&snapshot.files.empty(),"Grouping by filename never modifies persistent metadata");
 }
 
