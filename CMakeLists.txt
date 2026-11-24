@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 project(Viewery VERSION 0.2.0 LANGUAGES CXX)
-set(VIEWERY_VERSION "0.2.0-beta.4" CACHE STRING "Semantic version published by Viewery")
+set(VIEWERY_VERSION "0.2.0-beta.5" CACHE STRING "Semantic version published by Viewery")
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR NOT MSVC)
     message(FATAL_ERROR "Viewery requires Windows x64 and the Microsoft C++ toolchain.")
 endif()

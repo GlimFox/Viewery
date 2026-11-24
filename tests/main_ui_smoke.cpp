@@ -315,7 +315,7 @@ void checkCatalogScrollbar(viewery::App& app, const std::vector<std::filesystem:
         CatalogFile file;file.path=paths.front().parent_path()/(L"synthetic-"+std::to_wstring(index)+L".png");
         file.name=file.path.filename().wstring();file.extension=L".png";app.files_.push_back(std::move(file));
     }
-    for(const auto panel:{Panel::left,Panel::bottom}) {
+    for(const auto panel:{Panel::left,Panel::bottom,Panel::left}) {
         app.panel_=panel;app.scroll_=0;app.layout();finishPaint(app.window_);
         const bool horizontal=panel==Panel::bottom;
         const auto bar=app.catalogScroll_;
@@ -340,12 +340,44 @@ void checkCatalogScrollbar(viewery::App& app, const std::vector<std::filesystem:
             " page="<<range.nPage<<" max="<<range.nMax<<std::endl;
         require(hasThumb&&info.xyThumbBottom>info.xyThumbTop,
             "native scrollbar exposes a draggable thumb in either orientation");
+        const int length=horizontal?spanX(client):spanY(client);
+        const int startCenter=(info.xyThumbTop+info.xyThumbBottom)/2;
+        app.scrollCatalog(app.maxScroll()/2);
+        GetScrollBarInfo(bar,OBJID_CLIENT,&info);
+        const int midCenter=(info.xyThumbTop+info.xyThumbBottom)/2;
+        app.scrollCatalog(app.maxScroll()-app.scroll_);
+        GetScrollBarInfo(bar,OBJID_CLIENT,&info);
+        const int endCenter=(info.xyThumbTop+info.xyThumbBottom)/2;
+        require(startCenter<midCenter&&midCenter<endCenter&&startCenter<length/4&&endCenter>length*3/4,
+            "native thumb travels forward over the long axis after each panel orientation change");
+        app.scrollCatalog(-app.scroll_);GetScrollBarInfo(bar,OBJID_CLIENT,&info);
         const int middle=horizontal?spanY(client)/2:spanX(client)/2;
         const auto point=[&](int along){return horizontal?MAKELPARAM(along,middle):MAKELPARAM(middle,along);};
         const int pagePoint=info.xyThumbBottom+4;
         SendMessageW(bar,WM_LBUTTONDOWN,MK_LBUTTON,point(pagePoint));
         SendMessageW(bar,WM_LBUTTONUP,0,point(pagePoint));
         require(app.scroll_>0&&GetCapture()!=bar,"clicking the scrollbar track advances thumbnails and releases capture");
+        app.scrollCatalog(app.maxScroll()/2-app.scroll_);
+        GetScrollBarInfo(bar,OBJID_CLIENT,&info);
+        const int travel=length-info.dxyLineButton*2-(info.xyThumbBottom-info.xyThumbTop);
+        const int distance=std::max(1,travel/5);
+        const int dragOrigin=(info.xyThumbTop+info.xyThumbBottom)/2;
+        const int beforeDrag=app.scroll_;
+        SendMessageW(bar,WM_LBUTTONDOWN,MK_LBUTTON,point(dragOrigin));
+        SendMessageW(bar,WM_MOUSEMOVE,MK_LBUTTON,point(dragOrigin+distance));
+        SendMessageW(bar,WM_LBUTTONUP,0,point(dragOrigin+distance));
+        require(app.scroll_>beforeDrag&&app.scroll_<app.maxScroll(),"dragging the thumb right or down advances without jumping to the end");
+        GetScrollBarInfo(bar,OBJID_CLIENT,&info);
+        const int advancedCenter=(info.xyThumbTop+info.xyThumbBottom)/2;
+        require(advancedCenter>dragOrigin&&std::abs(advancedCenter-dragOrigin-distance)<=2,
+            "painted native thumb follows the forward pointer movement");
+        const int advanced=app.scroll_;
+        SendMessageW(bar,WM_LBUTTONDOWN,MK_LBUTTON,point(advancedCenter));
+        SendMessageW(bar,WM_MOUSEMOVE,MK_LBUTTON,point(advancedCenter-distance));
+        SendMessageW(bar,WM_LBUTTONUP,0,point(advancedCenter-distance));
+        GetScrollBarInfo(bar,OBJID_CLIENT,&info);
+        require(app.scroll_<advanced&&std::abs((info.xyThumbTop+info.xyThumbBottom)/2-dragOrigin)<=2,
+            "dragging the thumb left or up moves content and thumb back together");
         app.scrollCatalog(-app.maxScroll());
         GetScrollBarInfo(bar,OBJID_CLIENT,&info);
         const int thumb=(info.xyThumbTop+info.xyThumbBottom)/2;
@@ -579,10 +611,34 @@ int wmain(int argc, wchar_t** argv)
             const auto revealButton=app.buttons_[static_cast<UINT>(Control::catalogReveal)-static_cast<UINT>(Control::open)];
             require(IsWindowVisible(revealButton)&&IsWindowEnabled(revealButton),"catalog provides an enabled compact Explorer reveal button for the current selection");
             const bool previousSelectionMode = app.selectMode_;
+            const auto previewBeforeToggle=app.path_;
             app.command(static_cast<UINT>(Control::catalogSelect));
-            require(app.selectMode_ != previousSelectionMode, "catalog checkbox button toggles selection mode directly");
+            require(app.selectMode_ != previousSelectionMode&&app.selectedFiles_.empty()&&app.selectionAnchor_==-1&&app.path_==previewBeforeToggle,
+                "enabling checkbox mode clears previous checks and anchor while preserving the preview");
+            app.selectCatalog(3,0,true);app.selectCatalog(6,0,true);
+            require(app.selectedFiles_.size()==2,"checkbox fixture selects a new batch after mode toggle");
             app.command(static_cast<UINT>(Control::catalogSelect));
-            require(app.selectMode_ == previousSelectionMode, "catalog selection mode button toggles back without changing files");
+            require(app.selectMode_ == previousSelectionMode&&app.selectedFiles_.empty()&&app.selectionAnchor_==-1&&app.path_==previewBeforeToggle,
+                "disabling checkbox mode also clears checks and anchor without changing the preview");
+            app.selectMode_=true;app.selectedFiles_={paths[3],paths[4]};app.selectionAnchor_=4;app.syncStudio();
+            SetWindowTextW(descendant(app.studio_->window(),1006),L"Fixture Artist");
+            SendMessageW(descendant(app.studio_->window(),1041),BM_CLICK,0,0);
+            require(wait([&]{return !app.studio_->busy()&&app.studio_->queuedFileCount()==2&&app.selectedFiles_.empty();}),
+                "adding a real asynchronous batch clears all checked files after owner notification");
+            require(app.selectionAnchor_==-1&&app.path_==previewBeforeToggle&&app.selectMode_&&!app.studio_->takeBatchQueued(),
+                "queued batch reset preserves preview and checkbox mode and consumes its notification once");
+            app.selectCatalog(7,0,true);app.selectCatalog(8,0,true);
+            app.command(static_cast<UINT>(Control::catalogSelect));
+            require(app.selectedFiles_.empty()&&app.studio_->queuedFileCount()==2,
+                "mode toggle clears the next selection while preserving the approved queue");
+            app.artists_=std::make_unique<ArtistRegistry>(app.window_,artistMessage,[]{},root/L"collection.sqlite3");
+            SendMessageW(descendant(app.studio_->window(),RenameStudio::artistsCommandId),BM_CLICK,0,0);
+            require(wait([&]{return IsWindowVisible(app.artists_->window())&&!app.artists_->busy();}),
+                "small Studio artist button opens the existing registry through the real owner command");
+            require(app.detail_==Detail::renameStudio&&app.studio_->queuedFileCount()==2,
+                "opening artists preserves the rename panel and prepared batches");
+            app.artists_.reset();
+            app.selectedFiles_={paths[3],paths[4],paths[5],paths[6]};app.syncStudio();
             app.command(static_cast<UINT>(Control::catalogArtists));
             require(std::ranges::any_of(popupCaptions, [](const auto& label) { return label.find(L"Все файлы") != std::wstring::npos; }) &&
                     std::ranges::any_of(popupCaptions, [](const auto& label) { return label.find(L"художников") != std::wstring::npos; }),

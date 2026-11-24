@@ -63,7 +63,7 @@ constexpr UINT refreshTimer = 1;
 constexpr UINT canvasClickTimer = 2;
 constexpr UINT filenameTimer = 3;
 #ifndef VIEWERY_VERSION
-#define VIEWERY_VERSION "0.2.0-beta.4"
+#define VIEWERY_VERSION "0.2.0-beta.5"
 #endif
 
 constexpr COLORREF background = RGB(14, 16, 21);
@@ -362,6 +362,7 @@ private:
     int maxScroll() const;
     void scrollCatalog(int distance);
     RECT catalogViewport() const;
+    bool createCatalogScroll(bool horizontal);
     void updateCatalogScroll();
     void paintCatalogScroll(HWND window);
     std::vector<fs::path> revealTargets() const;
@@ -719,6 +720,23 @@ void App::paintCatalogScroll(HWND window)
     EndPaint(window,&paint);
 }
 
+bool App::createCatalogScroll(bool horizontal)
+{
+    const HWND next=CreateWindowExW(0,L"SCROLLBAR",L"Прокрутка миниатюр",WS_CHILD|(horizontal?SBS_HORZ:SBS_VERT),
+        0,0,0,0,window_,reinterpret_cast<HMENU>(static_cast<UINT_PTR>(catalogScrollId)),instance_,nullptr);
+    if(!next) return false;
+    SetWindowTheme(next,L"DarkMode_Explorer",nullptr);
+    SetWindowSubclass(next,catalogScrollProc,1,reinterpret_cast<DWORD_PTR>(this));
+    if(catalogScroll_) {
+        KillTimer(catalogScroll_,1);
+        if(GetCapture()==catalogScroll_) ReleaseCapture();
+        DestroyWindow(catalogScroll_);
+    }
+    catalogScrollDragging_=false;catalogScrollHold_=0;
+    catalogScroll_=next;
+    return true;
+}
+
 void App::updateCatalogScroll()
 {
     if(!catalogScroll_) return;
@@ -727,8 +745,10 @@ void App::updateCatalogScroll()
     const bool visible=mode_==Mode::full&&!fullscreen_&&panel_!=Panel::hidden&&!IsRectEmpty(&view)&&maxScroll()>0;
     if(!visible) {childVisible(catalogScroll_,false);return;}
     const LONG_PTR style=GetWindowLongPtrW(catalogScroll_,GWL_STYLE);
-    const LONG_PTR next=(style&~static_cast<LONG_PTR>(SBS_VERT))|(horizontal?SBS_HORZ:SBS_VERT);
-    if(next!=style) SetWindowLongPtrW(catalogScroll_,GWL_STYLE,next);
+    // SCROLLBAR caches its orientation at creation; changing SBS_VERT alone
+    // leaves native thumb geometry on the old axis, even after FRAMECHANGED.
+    const bool orientationChanged=((style&SBS_VERT)==0)!=horizontal;
+    if(orientationChanged&&!createCatalogScroll(horizontal)) {childVisible(catalogScroll_,false);return;}
     const RECT bounds=horizontal?RECT{view.left,view.bottom,catalogRect_.right,catalogRect_.bottom}:
         RECT{view.right,view.top,catalogRect_.right,view.bottom};
     const bool moved=arrangeChild(catalogScroll_,bounds,true);
@@ -736,7 +756,7 @@ void App::updateCatalogScroll()
     SCROLLINFO previous{sizeof(previous),SIF_RANGE|SIF_PAGE|SIF_POS};GetScrollInfo(catalogScroll_,SB_CTL,&previous);
     SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE|SIF_POS};info.nMin=0;info.nMax=maxScroll()+page-1;
     info.nPage=static_cast<UINT>(page);info.nPos=scroll_;
-    if(moved||next!=style||previous.nMax!=info.nMax||previous.nPage!=info.nPage||previous.nPos!=info.nPos) {
+    if(moved||orientationChanged||previous.nMax!=info.nMax||previous.nPage!=info.nPage||previous.nPos!=info.nPos) {
         // Realize native thumb geometry before our WM_PAINT override reads it.
         SetScrollInfo(catalogScroll_,SB_CTL,&info,TRUE);InvalidateRect(catalogScroll_,nullptr,FALSE);
     }
@@ -808,12 +828,7 @@ bool App::makeViewer()
                                   0,0,0,0,window_,reinterpret_cast<HMENU>(static_cast<UINT_PTR>(catalogSearchId)),
                                   instance_,nullptr);
     SendMessageW(catalogSearch_,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(L"Поиск"));
-    catalogScroll_=CreateWindowExW(0,L"SCROLLBAR",L"Прокрутка миниатюр",WS_CHILD|SBS_VERT,
-        0,0,0,0,window_,reinterpret_cast<HMENU>(static_cast<UINT_PTR>(catalogScrollId)),instance_,nullptr);
-    if(catalogScroll_) {
-        SetWindowTheme(catalogScroll_,L"DarkMode_Explorer",nullptr);
-        SetWindowSubclass(catalogScroll_,catalogScrollProc,1,reinterpret_cast<DWORD_PTR>(this));
-    }
+    if(!createCatalogScroll(false)) return false;
     editBrush_ = CreateSolidBrush(raised);
     tooltip_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
                                0, 0, 0, 0, window_, nullptr, instance_, nullptr);
@@ -2360,6 +2375,10 @@ void App::acceptArtistChanges()
 void App::acceptLibraryChanges()
 {
     if(!studio_) return;
+    if(studio_->takeBatchQueued()) {
+        selectedFiles_.clear();selectionAnchor_=-1;
+        syncStudio();
+    }
     const auto changes=studio_->takeFileChanges();
     bool viewedFileMoved=false;
     if(changes) {
@@ -2829,7 +2848,9 @@ void App::command(UINT id)
         ensureStudio();collectionOptions_.filter.artist.clear();collectionOptions_.group=CollectionGroup::artist;collectionOptions_.sort=CollectionSort::artist;
         rebuildCollectionView();scroll_=0;savePreferences();layout();return;
     case RenameStudio::closeCommandId:closeStudio();return;
-    case selectionMode:selectMode_=!selectMode_;syncStudio();layout();return;
+    case selectionMode:
+        selectMode_=!selectMode_;selectedFiles_.clear();selectionAnchor_=-1;
+        syncStudio();layout();return;
     case selectionClear:selectedFiles_.clear();syncStudio();layout();return;
     case selectionAll:
         if(renameEnabled_) for(const auto& file:files_) selectedFiles_.insert(file.path);
@@ -3259,6 +3280,7 @@ LRESULT App::dispatch(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
         break;
     case WM_COMMAND:
         if(LOWORD(wparam)==RenameStudio::closeCommandId) {closeStudio();return 0;}
+        if(LOWORD(wparam)==RenameStudio::artistsCommandId) {openArtistRegistry();return 0;}
         if(LOWORD(wparam)==catalogSearchId&&HIWORD(wparam)==EN_CHANGE&&studio_) {
             std::wstring value(static_cast<std::size_t>(GetWindowTextLengthW(catalogSearch_))+1,L'\0');
             value.resize(static_cast<std::size_t>(GetWindowTextW(catalogSearch_,value.data(),static_cast<int>(value.size()))));
