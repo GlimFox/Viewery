@@ -20,7 +20,7 @@
 #include <vector>
 
 #ifndef VIEWERY_VERSION
-#define VIEWERY_VERSION "0.2.0-beta.5"
+#define VIEWERY_VERSION "0.2.0-beta.6"
 #endif
 
 namespace viewery {
@@ -141,42 +141,96 @@ struct InternetHandle {
     HINTERNET handle;
 };
 
+class ReleaseCheckError : public std::runtime_error {
+public:
+    explicit ReleaseCheckError(std::wstring message):std::runtime_error("Release check failed"),message(std::move(message)) {}
+    std::wstring message;
+};
+
+[[noreturn]] void failReleaseNetwork(DWORD code)
+{
+    throw ReleaseCheckError(L"Не удалось обратиться к GitHub (WinHTTP "+std::to_wstring(code)+L"). Повторите проверку позже.");
+}
+
+std::wstring releaseHttpFailure(DWORD status)
+{
+    if(status==403||status==429)
+        return L"GitHub отклонил запрос или ограничил частоту проверок (HTTP "+std::to_wstring(status)+L"). Повторите позже.";
+    return L"Сервис обновлений GitHub вернул HTTP "+std::to_wstring(status)+L". Повторите проверку позже.";
+}
+
 std::string releaseFeed(std::stop_token stop)
 {
+    if(stop.stop_requested()) throw ReleaseCheckError(L"Проверка обновлений отменена.");
     InternetHandle session(WinHttpOpen(L"Viewery/" L"0.2", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                       WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
-    if (!session.handle) throw std::runtime_error("WinHTTP session");
+    if (!session.handle) failReleaseNetwork(GetLastError());
     WinHttpSetTimeouts(session.handle, 3500, 3500, 3500, 6500);
     InternetHandle connection(WinHttpConnect(session.handle, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0));
-    if (!connection.handle) throw std::runtime_error("WinHTTP connection");
+    if (!connection.handle) failReleaseNetwork(GetLastError());
     InternetHandle request(WinHttpOpenRequest(connection.handle, L"GET", repositoryPath, nullptr,
                                             WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE));
-    if (!request.handle) throw std::runtime_error("WinHTTP request");
+    if (!request.handle) failReleaseNetwork(GetLastError());
     const DWORD redirects = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
     WinHttpSetOption(request.handle, WINHTTP_OPTION_REDIRECT_POLICY, const_cast<DWORD*>(&redirects), sizeof(redirects));
     constexpr wchar_t headers[] = L"Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n";
     if (stop.stop_requested() || !WinHttpSendRequest(request.handle, headers, static_cast<DWORD>(-1),
             WINHTTP_NO_REQUEST_DATA, 0, 0, 0) || !WinHttpReceiveResponse(request.handle, nullptr)) {
-        throw std::runtime_error("Cannot reach release service");
+        failReleaseNetwork(GetLastError());
     }
     DWORD status = 0, size = sizeof(status);
     if (!WinHttpQueryHeaders(request.handle, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                             WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX) || status != 200) {
-        throw std::runtime_error("Release service is unavailable");
+                             WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX)) {
+        failReleaseNetwork(GetLastError());
     }
+    if(status!=200) throw ReleaseCheckError(releaseHttpFailure(status));
     std::string body;
     std::array<char, 16384> buffer{};
     const auto deadline = std::chrono::steady_clock::now() + 20s;
     while (!stop.stop_requested() && std::chrono::steady_clock::now() < deadline) {
         DWORD read = 0;
         if (!WinHttpReadData(request.handle, buffer.data(), static_cast<DWORD>(buffer.size()), &read)) {
-            throw std::runtime_error("Incomplete release metadata");
+            failReleaseNetwork(GetLastError());
         }
         if (!read) return body;
-        if (body.size() + read > 2 * 1024 * 1024) throw std::runtime_error("Release metadata limit");
+        if (body.size() + read > 2 * 1024 * 1024) throw ReleaseCheckError(L"Сервис обновлений вернул слишком большой ответ.");
         body.append(buffer.data(), read);
     }
-    throw std::runtime_error("Release check canceled or timed out");
+    throw ReleaseCheckError(stop.stop_requested()?L"Проверка обновлений отменена.":L"GitHub не ответил вовремя. Повторите проверку позже.");
+}
+
+UpdateInfo releaseInfo(const Json& releases,std::string_view installedVersion)
+{
+    const auto installed=version(installedVersion);
+    if(!installed) throw std::invalid_argument("Invalid app version");
+    if(!releases.is_array()) throw ReleaseCheckError(L"Сервис обновлений вернул некорректные данные.");
+    UpdateInfo result;
+    std::optional<Version> newest;
+    for(const auto& release:releases) {
+        if(!release.is_object()) continue;
+        const auto draft=release.find("draft"),prerelease=release.find("prerelease");
+        if(draft==release.end()||!draft->is_boolean()||draft->get<bool>()||
+           (prerelease!=release.end()&&!prerelease->is_boolean())||
+           (installed->prerelease.empty()&&prerelease!=release.end()&&prerelease->get<bool>())) continue;
+        auto candidate=version(jsonText(release,"tag_name"));
+        if(!candidate||(installed->prerelease.empty()&&!candidate->prerelease.empty())||
+           compare(*candidate,*installed)<0||(newest&&compare(*candidate,*newest)<=0)) continue;
+        const auto url=winrt::to_hstring(jsonText(release,"html_url"));
+        if(!std::wstring_view(url).starts_with(releasePrefix)) continue;
+        newest=std::move(candidate);
+        result.version=winrt::to_hstring(jsonText(release,"tag_name"));
+        result.notes=winrt::to_hstring(jsonText(release,"body"));
+        if(result.notes.size()>12000) result.notes.resize(12000);
+        result.releaseUrl=url;
+    }
+    if(newest&&compare(*newest,*installed)>0) {
+        result.status=UpdateStatus::available;
+        result.message=L"Доступна версия "+result.version;
+    } else {
+        result.status=UpdateStatus::current;
+        result.message=L"Установлена актуальная версия "+std::wstring(winrt::to_hstring(installedVersion));
+    }
+    return result;
 }
 
 bool allowedInstallerUri(std::wstring_view value)
@@ -302,6 +356,7 @@ bool UpdateService::check(bool manual)
         std::lock_guard guard(mutex_);
         result_ = {};
         result_.status = UpdateStatus::checking;
+        result_.message=L"Проверка обновлений…";
         result_.manual = manual;
         installerUri_.clear();
     }
@@ -310,28 +365,11 @@ bool UpdateService::check(bool manual)
         result.manual = manual;
         try {
             Apartment apartment;
-            const auto installed = version(VIEWERY_VERSION);
-            if (!installed) throw std::runtime_error("Invalid app version");
+            if(!version(VIEWERY_VERSION)) throw std::invalid_argument("Invalid app version");
             const Json releases = Json::parse(releaseFeed(stop));
-            if (!releases.is_array()) throw std::runtime_error("Invalid release feed");
-            std::optional<Version> newest;
-            for (const auto& release : releases) {
-                if (!release.is_object() || release.value("draft", true) ||
-                    (installed->prerelease.empty() && release.value("prerelease", false))) continue;
-                auto candidate = version(jsonText(release, "tag_name"));
-                if (!candidate || (installed->prerelease.empty() && !candidate->prerelease.empty()) ||
-                    compare(*candidate, *installed) <= 0 || (newest && compare(*candidate, *newest) <= 0)) continue;
-                const auto url = winrt::to_hstring(jsonText(release, "html_url"));
-                if (!std::wstring_view(url).starts_with(releasePrefix)) continue;
-                newest = std::move(candidate);
-                result.version = winrt::to_hstring(jsonText(release, "tag_name"));
-                result.notes = winrt::to_hstring(jsonText(release, "body"));
-                if (result.notes.size() > 12000) result.notes.resize(12000);
-                result.releaseUrl = url;
-            }
-            if (newest) {
-                result.status = UpdateStatus::available;
-                result.message = L"Доступна версия " + result.version;
+            result=releaseInfo(releases,VIEWERY_VERSION);
+            result.manual=manual;
+            if (result.status==UpdateStatus::available) {
                 const auto package = installedPackage();
                 if (package) {
                     const auto installer = package.GetAppInstallerInfo();
@@ -351,10 +389,17 @@ bool UpdateService::check(bool manual)
                 if (!result.canInstall) {
                     result.message += L". Автоустановка доступна для подписанной версии, установленной через App Installer.";
                 }
-            } else {
-                result.status = UpdateStatus::current;
-                result.message = L"Установлена актуальная версия " + std::wstring(winrt::to_hstring(VIEWERY_VERSION));
             }
+        } catch(const std::invalid_argument&) {
+            result.status=UpdateStatus::failed;
+            result.message=L"В сборке Viewery указан некорректный номер версии. Установите официальную сборку из раздела релизов.";
+        } catch(const ReleaseCheckError& error) {
+            result.status=UpdateStatus::failed;result.message=error.message;
+        } catch(const Json::exception&) {
+            result.status=UpdateStatus::failed;result.message=L"Сервис обновлений вернул некорректные данные. Повторите проверку позже.";
+        } catch(const winrt::hresult_error& error) {
+            wchar_t code[16]{};swprintf_s(code,L"0x%08X",static_cast<unsigned>(error.code().value));
+            result.status=UpdateStatus::failed;result.message=L"Ошибка Windows при проверке обновлений ("+std::wstring(code)+L").";
         } catch (...) {
             result.status = UpdateStatus::failed;
             result.message = L"Не удалось проверить обновления. Проверьте подключение и повторите позже.";

@@ -4,7 +4,7 @@
 
 ## Коллекция и переименование
 
-Версия Next 0.2.0-beta.5 включает базу художников, очередь нескольких пачек, отдельные окна шаблонов и настроек, локальную коллекцию и историю с Undo после перезапуска.
+Версия Next 0.2.0-beta.6 включает базу художников, очередь нескольких пачек, отдельные окна шаблонов и настроек, локальную коллекцию и историю с Undo после перезапуска.
 
 ![Предпросмотр Rename Studio на тестовых файлах](docs/images/rename-studio.png)
 
@@ -40,7 +40,7 @@
 
 Portable ZIP распаковывается в постоянный каталог. Медиакомпоненты устанавливаются через меню «Установить медиакомпоненты» с проверкой закреплённых SHA-256. Они хранятся отдельно в %LOCALAPPDATA%/Viewery/MediaTools.
 
-В меню есть «Проверить обновления», «Что нового», установка доступного подписанного обновления и отключение автоматических проверок. Проверка выполняется в фоне. Подготовлен полный MSIX и канал App Installer, база и настройки расположены вне каталога установки.
+В меню есть «Проверить обновления», «Что нового», установка доступного подписанного обновления и отключение автоматических проверок. Проверка выполняется в фоне и при ошибке показывает её причину. «Что нового» доступно при наличии заметок, в том числе для уже установленной актуальной версии; без заметок и во время проверки кнопка отключена. Подготовлен полный MSIX и канал App Installer, база и настройки расположены вне каталога установки.
 
 Для выпуска доверенного установщика нужен сертификат подписи. На этом этапе сертификат отсутствует, первая установка подписанного MSIX и обновление между двумя установленными версиями ещё не проверены. [Сборка и выпуск](docs/RELEASE.md)
 
@@ -123,7 +123,7 @@ GIF ограничен палитрой и не содержит звуково�
 Для сборки нужны Visual Studio 2022 или новее с компонентом **Desktop development with C++**, Windows SDK и CMake 3.25+. Генератор Visual Studio 2026 требует CMake 4.2+.
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DVIEWERY_MEDIA_TESTS=ON
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 "-DVIEWERY_VERSION=0.2.0-beta.6" -DVIEWERY_MEDIA_TESTS=ON
 cmake --build build --config Release --parallel
 .\scripts\Get-MediaTools.ps1 -Destination .\build\bin\Release
 ctest --test-dir build -C Release --output-on-failure
@@ -131,6 +131,8 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 Для Visual Studio 2026 укажите `-G "Visual Studio 18 2026"`. Для Ninja можно выполнить те же шаги из x64 Developer PowerShell, указав `-G Ninja -DCMAKE_BUILD_TYPE=Release` и каталог `build/bin` для бинарников. Если локализованный инструментарий не проходит пробу компилятора с Ninja, укажите `-DCMAKE_TRY_COMPILE_CONFIGURATION=Release -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded` на этапе конфигурации.
+
+В PowerShell заключайте весь аргумент с номером версии в кавычки: `"-DVIEWERY_VERSION=0.2.0-beta.6"`, `"-DCMAKE_SYSTEM_VERSION=10.0.26100.0"`. Без кавычек PowerShell может разбить такой аргумент и записать в кеш CMake `VIEWERY_VERSION=0`. Некорректный номер теперь останавливает конфигурацию; повторите её с полным номером в кавычках, чтобы заменить прежнее значение кеша.
 
 CTest создаёт тестовые PNG, GIF и MP4 без внешних образцов. Проверяются кадры 0,0 → 0,1 → 0,2 → 0,4 → 0,2 секунды в GIF и MP4 с переменной частотой кадров, автопауза, перемотка, масштаб, скорость и громкость. Отдельная проверка запускает FFmpeg для целого видео и фрагмента, проверяет отмену, Unicode в путях и защиту от перезаписи. Для сборки одного приложения оставьте `VIEWERY_MEDIA_TESTS` выключенным.
 
@@ -141,9 +143,16 @@ CTest создаёт тестовые PNG, GIF и MP4 без внешних об
 Для проверки нативной панели Rename Studio включите `VIEWERY_GUI_TESTS`. Тест создаёт отдельный рабочий стол Windows и уникальную временную базу в каталоге сборки. Он проверяет назначение метаданных, сохранение шаблона, смену выделения во время предпросмотра, подтверждённое переименование и Undo. Отдельный GUI-тест базы художников проверяет её форму, добавление, переименование и удаление на тестовых файлах. В среде, запрещающей создание отдельного рабочего стола, CTest отмечает эти сценарии как пропущенные.
 
 ```powershell
-cmake -S . -B build -DVIEWERY_GUI_TESTS=ON
+cmake -S . -B build "-DVIEWERY_VERSION=0.2.0-beta.6" -DVIEWERY_GUI_TESTS=ON
 cmake --build build --config Release --target viewery-rename-studio-tests viewery-main-ui-tests viewery-artist-registry-tests
 ctest --test-dir build -C Release -R "rename-studio-gui|main-window-gui|artist-registry-gui" --output-on-failure
+```
+
+Для диагностики обновлений именно из собранного EXE используйте `--check-updates`. Режим выводит номер сборки и результат запроса в перенаправленный stdout, не открывает окна, не меняет настройки и не затрагивает работающий просмотрщик:
+
+```powershell
+Start-Process .\build\bin\Release\Viewery.exe -ArgumentList '--check-updates' -RedirectStandardOutput .\update-check.txt -Wait -WindowStyle Hidden
+Get-Content .\update-check.txt -Encoding UTF8
 ```
 
 ### Ручная проверка Проводника

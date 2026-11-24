@@ -6,6 +6,13 @@
 namespace {
 std::vector<std::wstring> popupCaptions;
 unsigned preferenceWriteAttempts = 0;
+unsigned updateDialogCount=0;
+std::wstring updateDialogText;
+
+int WINAPI inspectMessageBox(HWND,LPCWSTR text,LPCWSTR,UINT)
+{
+    ++updateDialogCount;updateDialogText=text?text:L"";return IDOK;
+}
 
 LSTATUS WINAPI ignorePreferenceWrite(HKEY, LPCWSTR, LPCWSTR, DWORD, LPCVOID, DWORD)
 {
@@ -29,7 +36,9 @@ BOOL WINAPI inspectPopup(HMENU menu, UINT, int, int, int, HWND, const RECT*)
 
 #define TrackPopupMenu inspectPopup
 #define RegSetKeyValueW ignorePreferenceWrite
+#define MessageBoxW inspectMessageBox
 #include "main_ui_source.inc"
+#undef MessageBoxW
 #undef RegSetKeyValueW
 #undef TrackPopupMenu
 
@@ -106,6 +115,22 @@ void finishPaint(HWND parent)
     pump();
     UpdateWindow(parent);
     pump();
+}
+
+void checkUpdateNotes(viewery::App& app)
+{
+    using namespace viewery;
+    const auto saved=app.updateInfo_;
+    const auto dialogs=updateDialogCount;
+    app.updateInfo_={};app.updateInfo_.status=UpdateStatus::failed;
+    require(!app.settingsState().canShowReleaseNotes,"failed update check without notes disables What is new");
+    app.command(updatesNotes);
+    require(updateDialogCount==dialogs,"empty update notes command never opens a blank dialog");
+    app.updateInfo_.status=UpdateStatus::current;app.updateInfo_.notes=L"Current release notes";
+    require(app.settingsState().canShowReleaseNotes,"up-to-date version can expose its current release notes");
+    app.command(updatesNotes);
+    require(updateDialogCount==dialogs+1&&updateDialogText==L"Current release notes","What is new opens the actual current release notes");
+    app.updateInfo_=saved;
 }
 
 void checkStableLayout(viewery::App& app)
@@ -548,6 +573,7 @@ int wmain(int argc, wchar_t** argv)
             // tray icon or automatic update request belongs in this test.
             App app(GetModuleHandleW(nullptr));
             require(app.makeViewer(), "viewer creates without application startup or user settings");
+            checkUpdateNotes(app);
             // A dormant integration object provides the ordinary lifecycle API;
             // start() is deliberately never called, so no global hook is installed.
             app.explorer_ = std::make_unique<ExplorerIntegration>(app.window_,
