@@ -49,7 +49,7 @@
 `collection-view` проверяет группировку по текущему имени после Undo и внешнего переименования. `explorer-selection-plan` проверяет план выделения для одной и нескольких папок, Unicode, UNC и повторов путей; он не открывает окна Проводника. `artist-registry-gui` проверяет отдельное нативное окно на изолированном рабочем столе Windows и пропускается с кодом 77, если такой рабочий стол создать нельзя.
 
 ```powershell
-cmake -S . -B build -DVIEWERY_GUI_TESTS=ON -DVIEWERY_VERSION=0.2.0-beta.5
+cmake -S . -B build -DVIEWERY_GUI_TESTS=ON "-DVIEWERY_VERSION=0.2.0-beta.6"
 cmake --build build --config Release --parallel
 ctest --test-dir build -C Release -R "collection-and-rename|collection-view|explorer-selection-plan|artist-registry-gui" --output-on-failure
 ```

@@ -27,6 +27,7 @@ struct SettingsState {
     bool groupControlChord = false;
     bool updateBusy = false;
     bool canInstall = false;
+    bool canShowReleaseNotes = false;
     std::wstring version;
     std::wstring updateStatus;
 };

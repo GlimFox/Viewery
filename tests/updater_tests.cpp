@@ -15,6 +15,7 @@ int main()
 {
     try {
         using namespace viewery;
+        require(version(VIEWERY_VERSION).has_value(),"The compiled application version is invalid; check quoted CMake -DVIEWERY_VERSION argument");
         const auto beta1 = version("v0.2.0-beta.1");
         const auto beta2 = version("0.2.0-beta.2");
         const auto beta10 = version("0.2.0-beta.10");
@@ -28,6 +29,33 @@ int main()
         require(std::wstring_view(winrt::to_hstring(jsonText(unicode,"body"))) == L"Кириллица \U0001F600", "UTF-8 release notes conversion");
         require(jsonText(Json::parse(R"({"body":null})"),"body").empty(), "nullable release body rejected");
         require(jsonText(unicode,"missing").empty(), "missing optional release field rejected");
+        const auto release=[](const char* tag,const char* body="Release notes") {
+            return Json{{"draft",false},{"prerelease",true},{"tag_name",tag},{"html_url",std::string("https://github.com/GlimFox/Viewery/releases/tag/")+tag},{"body",body}};
+        };
+        auto feed=Json::array({release("v0.2.0-beta.4"),release("v0.2.0-beta.5"),release("v0.2.0-beta.10")});
+        const auto available=releaseInfo(feed,"0.2.0-beta.4");
+        require(available.status==UpdateStatus::available&&available.version==L"v0.2.0-beta.10"&&!available.notes.empty(),
+            "unsorted release list chooses numeric newest version and its notes");
+        const auto current=releaseInfo(feed,"0.2.0-beta.10");
+        require(current.status==UpdateStatus::current&&current.version==L"v0.2.0-beta.10"&&current.notes==L"Release notes"&&!current.releaseUrl.empty(),
+            "current release keeps notes for What is new instead of opening an empty dialog");
+        require(releaseInfo(feed,"0.2.0").status==UpdateStatus::current&&releaseInfo(feed,"0.2.0").notes.empty(),
+            "stable installation does not offer prerelease versions or their notes");
+        auto broken=release("v9.0.0");broken["draft"]=nullptr;feed.push_back(broken);
+        broken["draft"]="false";feed.insert(feed.begin(),broken);
+        broken["draft"]=false;broken["prerelease"]=nullptr;feed.push_back(broken);
+        broken=release("v9.0.0");broken["html_url"]="https://example.org/untrusted";feed.push_back(broken);
+        require(releaseInfo(feed,"0.2.0-beta.5").version==L"v0.2.0-beta.10","invalid release records cannot hide a valid update");
+        auto nullNotes=release("v0.2.0-beta.5");nullNotes["body"]=nullptr;nullNotes["assets"]="ignored";
+        require(releaseInfo(Json::array({nullNotes}),"0.2.0-beta.5").notes.empty(),"missing release notes remain unavailable rather than fabricated");
+        bool invalidBuild=false;try{(void)releaseInfo(feed,"0");}catch(const std::invalid_argument&){invalidBuild=true;}
+        require(invalidBuild,"invalid build version is identified before any network classification");
+        bool invalidFeed=false;try{(void)releaseInfo(Json::object(),"0.2.0-beta.5");}catch(const ReleaseCheckError&){invalidFeed=true;}
+        require(invalidFeed,"invalid top-level server response reports a data error");
+        require(releaseHttpFailure(502).find(L"502")!=std::wstring::npos&&releaseHttpFailure(403).find(L"403")!=std::wstring::npos,
+            "HTTP failures retain the status needed for diagnosis");
+        bool networkCode=false;try{failReleaseNetwork(ERROR_WINHTTP_TIMEOUT);}catch(const ReleaseCheckError& error){networkCode=error.message.find(L"12002")!=std::wstring::npos;}
+        require(networkCode,"WinHTTP failures retain the original Windows error code");
         for (const auto* invalid : {"", "updates-beta", "v0.2", "v0.2.0.4", "01.2.3", "0.2.0-", "0.2.0-beta.01", "0.2.0-beta.", "0.2.0-../evil", "0.2.0+", "0.2.0+x+y", "0.2.0+../evil"}) {
             require(!version(invalid), "invalid release accepted");
         }

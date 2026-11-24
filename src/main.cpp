@@ -63,7 +63,7 @@ constexpr UINT refreshTimer = 1;
 constexpr UINT canvasClickTimer = 2;
 constexpr UINT filenameTimer = 3;
 #ifndef VIEWERY_VERSION
-#define VIEWERY_VERSION "0.2.0-beta.5"
+#define VIEWERY_VERSION "0.2.0-beta.6"
 #endif
 
 constexpr COLORREF background = RGB(14, 16, 21);
@@ -2241,13 +2241,15 @@ void App::closeStudio()
 SettingsState App::settingsState() const
 {
     SettingsState state;
+    const bool updating=updates_&&updates_->busy();
+    const auto update=updating?updates_->take():updateInfo_;
     state.quickHotkey=explorer_?explorer_->hotkey():PreviewHotkey::space;
     state.automaticUpdates=UpdateService::automaticChecks();
     state.renameEnabled=renameEnabled_;state.groupControlChord=groupChordControl_;
-    state.updateBusy=updates_&&updates_->busy()&&(updateInfo_.status==UpdateStatus::checking||
-        updateInfo_.status==UpdateStatus::installing||updateInfo_.status==UpdateStatus::mediaInstalling);
-    state.canInstall=updateInfo_.status==UpdateStatus::available&&updateInfo_.canInstall;
-    state.version=L"" VIEWERY_VERSION;state.updateStatus=updateInfo_.message;
+    state.updateBusy=updating;
+    state.canInstall=update.status==UpdateStatus::available&&update.canInstall;
+    state.canShowReleaseNotes=!update.notes.empty();
+    state.version=L"" VIEWERY_VERSION;state.updateStatus=update.message;
     return state;
 }
 
@@ -2541,7 +2543,7 @@ void App::acceptUpdate()
     if(window_) InvalidateRect(window_,&statusRect_,FALSE);
     if(updateInfo_.manual&&updateInfo_.status!=UpdateStatus::checking&&
        updateInfo_.status!=UpdateStatus::installing&&updateInfo_.status!=UpdateStatus::mediaInstalling) {
-        const auto message=updateInfo_.message+(updateInfo_.notes.empty()?L"":L"\n\n"+updateInfo_.notes);
+        const auto& message=updateInfo_.message;
         MessageBoxW(window_?window_:controller_,message.c_str(),L"Обновления Viewery",MB_OK|
                     (updateInfo_.status==UpdateStatus::failed?MB_ICONWARNING:MB_ICONINFORMATION));
     } else if(updateInfo_.status==UpdateStatus::available) {
@@ -2908,6 +2910,7 @@ void App::command(UINT id)
     case updatesCheck:if(updates_) updates_->check(true);return;
     case mediaToolsInstall:if(updates_) updates_->installMediaTools();return;
     case updatesNotes:
+        if(updateInfo_.notes.empty()) return;
         MessageBoxW(window_?window_:controller_,updateInfo_.notes.c_str(),L"Что нового",MB_OK);return;
     case updatesInstall:
         if(studio_&&studio_->queuedFileCount()) {
@@ -3453,6 +3456,7 @@ int App::run()
 
 struct Launch {
     bool background = false;
+    bool checkUpdates = false;
     fs::path path;
     Mode mode = Mode::full;
 };
@@ -3465,6 +3469,7 @@ Launch parseLaunch()
     for (int i = 1; args && i < count; ++i) {
         const std::wstring_view arg(args[i]);
         if (arg == L"--background") result.background = true;
+        else if(arg==L"--check-updates") result.checkUpdates=true;
         else if ((arg == L"--open" || arg == L"--quick") && i + 1 < count) {
             result.path = args[++i];
             result.mode = arg == L"--quick" ? Mode::quick : Mode::full;
@@ -3507,6 +3512,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 {
     using namespace viewery;
     const auto launch = parseLaunch();
+    if(launch.checkUpdates) {
+        // Run the production updater in this exact executable without touching
+        // the existing viewer, preferences, tray icon or Explorer hooks.
+        UpdateService updates(nullptr,0);
+        updates.check(true);
+        while(updates.busy()) Sleep(25);
+        const auto result=updates.take();
+        const std::wstring report=L"Viewery " L"" VIEWERY_VERSION L"\r\n"+result.message+L"\r\n";
+        const int count=WideCharToMultiByte(CP_UTF8,0,report.data(),static_cast<int>(report.size()),nullptr,0,nullptr,nullptr);
+        std::string bytes(static_cast<std::size_t>(std::max(0,count)),'\0');
+        if(count>0) WideCharToMultiByte(CP_UTF8,0,report.data(),static_cast<int>(report.size()),bytes.data(),count,nullptr,nullptr);
+        DWORD written=0;
+        WriteFile(GetStdHandle(STD_OUTPUT_HANDLE),bytes.data(),static_cast<DWORD>(bytes.size()),&written,nullptr);
+        return result.status==UpdateStatus::failed?1:0;
+    }
     HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Local\\Viewery.Instance.1");
     if (!mutex) return 1;
     if (GetLastError() == ERROR_ALREADY_EXISTS) {

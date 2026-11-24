@@ -262,6 +262,7 @@ struct SettingsWindow::Impl {
         EnableWindow(c(checkButton),!state.updateBusy);
         EnableWindow(c(mediaButton),!state.updateBusy);
         EnableWindow(c(installButton),state.canInstall&&!state.updateBusy);
+        EnableWindow(c(notesButton),state.canShowReleaseNotes&&!state.updateBusy);
         filling=false;
     }
 
@@ -396,6 +397,7 @@ struct SettingsWindow::Impl {
             emit(SettingsAction::groupChord,state.groupControlChord?1:0);return;
         }
         if(notification!=BN_CLICKED) return;
+        if(!IsWindowEnabled(c(id))) return;
         switch(id) {
         case closeButton:hide();return;
         case renameCheck:
@@ -411,7 +413,9 @@ struct SettingsWindow::Impl {
         case importButton:emit(SettingsAction::importMetadata);return;
         case checkButton:emit(SettingsAction::checkUpdates);return;
         case installButton:emit(SettingsAction::installUpdate);return;
-        case notesButton:emit(SettingsAction::releaseNotes);return;
+        case notesButton:
+            if(state.canShowReleaseNotes&&!state.updateBusy) emit(SettingsAction::releaseNotes);
+            return;
         case mediaButton:emit(SettingsAction::mediaTools);return;
         case repositoryButton:emit(SettingsAction::repository);return;
         default:return;
