@@ -1,5 +1,6 @@
 #include "rename_studio.hpp"
 #include "rename_template.hpp"
+#include "ui_icons.hpp"
 
 #include <commctrl.h>
 #include <dwmapi.h>
@@ -159,7 +160,7 @@ void fill(HDC dc,RECT rect,COLORREF color) {
 struct RenameStudio::Impl {
     HWND owner=nullptr,window=nullptr,viewport=nullptr,content=nullptr,tips=nullptr,editorHost=nullptr;
     UINT changed=0,dpi=96;
-    HFONT font=nullptr,iconFont=nullptr;
+    HFONT font=nullptr;
     HBRUSH brush=CreateSolidBrush(bg),editBrush=CreateSolidBrush(inputColor);
     std::map<int,HWND> controls;
     std::vector<HWND> labels;
@@ -247,7 +248,6 @@ struct RenameStudio::Impl {
         worker.request_stop();
         if(worker.joinable()) worker.join();
         if(window) DestroyWindow(window);
-        if(iconFont) DeleteObject(iconFont);
         DeleteObject(brush);
         DeleteObject(editBrush);
     }
@@ -407,11 +407,6 @@ struct RenameStudio::Impl {
         for(const auto& [id,control]:controls) {
             (void)id;SendMessageW(control,WM_SETFONT,reinterpret_cast<WPARAM>(font),FALSE);
         }
-        const auto previous=iconFont;
-        iconFont=CreateFontW(-dp(17),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,0,L"Segoe Fluent Icons");
-        SendMessageW(c(RenameStudio::artistsCommandId),WM_SETFONT,reinterpret_cast<WPARAM>(iconFont?iconFont:font),FALSE);
-        if(previous) DeleteObject(previous);
         SendMessageW(c(blocks),LB_SETITEMHEIGHT,0,dp(32));
         for(int id:{assignment,blockKind,blockCase,counterScope}) {
             SendMessageW(c(id),CB_SETITEMHEIGHT,static_cast<WPARAM>(-1),dp(22));
@@ -1537,11 +1532,14 @@ struct RenameStudio::Impl {
                 }
                 const bool active=(draw.CtlID==static_cast<UINT>(tabAssign+tab));
                 fill(draw.hDC,draw.rcItem,active?RGB(42,37,69):inputColor);
-                const auto old=SelectObject(draw.hDC,draw.CtlID==RenameStudio::artistsCommandId&&iconFont?iconFont:font);
+                const auto color=(draw.itemState&ODS_DISABLED)?muted:active?accent:fg;
+                if(draw.CtlID==RenameStudio::artistsCommandId) {
+                    ui::drawIcon(draw.hDC,draw.rcItem,ui::Icon::artist,color,dpi);return TRUE;
+                }
+                const auto old=SelectObject(draw.hDC,font);
                 SetBkMode(draw.hDC,TRANSPARENT);
-                SetTextColor(draw.hDC,(draw.itemState&ODS_DISABLED)?muted:active?accent:fg);
+                SetTextColor(draw.hDC,color);
                 auto value=text(draw.hwndItem);
-                if(draw.CtlID==RenameStudio::artistsCommandId) value=L"\xE77B";
                 RECT bounds=draw.rcItem;bounds.left+=dp(5);bounds.right-=dp(5);
                 DrawTextW(draw.hDC,value.c_str(),static_cast<int>(value.size()),&bounds,
                           DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);

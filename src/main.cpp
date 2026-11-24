@@ -10,6 +10,7 @@
 #include "quick_space.hpp"
 #include "shell_selection.hpp"
 #include "artist_registry.hpp"
+#include "ui_icons.hpp"
 
 #include <commctrl.h>
 #include <dwmapi.h>
@@ -63,7 +64,7 @@ constexpr UINT refreshTimer = 1;
 constexpr UINT canvasClickTimer = 2;
 constexpr UINT filenameTimer = 3;
 #ifndef VIEWERY_VERSION
-#define VIEWERY_VERSION "0.2.0-beta.7"
+#define VIEWERY_VERSION "0.2.0-beta.8"
 #endif
 
 constexpr COLORREF background = RGB(14, 16, 21);
@@ -123,33 +124,34 @@ enum FileMenu : UINT {
     filePreview=1100,fileReveal,fileCopyPath,fileCopyName,fileCopy,fileProperties,fileSelect,fileRename
 };
 
-std::wstring_view iconFor(Control control, bool paused, bool fullscreen, bool bottom)
+ui::Icon iconFor(Control control, bool paused, bool fullscreen, bool bottom)
 {
+    using ui::Icon;
     switch (control) {
-    case Control::open: return L"\xE838";
-    case Control::catalog: return L"\xE8FD";
-    case Control::info: return L"\xE946";
-    case Control::exportGif: return L"\xE792";
-    case Control::more: return L"\xE712";
-    case Control::previous: return L"\xE892";
-    case Control::back: return L"\xE76B";
-    case Control::play: return paused ? L"\xE768" : L"\xE769";
-    case Control::step: return L"\xE76C";
-    case Control::next: return L"\xE893";
-    case Control::zoom: return L"\xE9A6";
-    case Control::fullScreen: return fullscreen ? L"\xE740" : L"\xE92D";
-    case Control::pin: return L"\xE718";
-    case Control::promote: return L"\xE8A7";
-    case Control::close: return L"\xE8BB";
-    case Control::panelPosition: return bottom ? L"\xE8A0" : L"\xE8A1";
-    case Control::volume: return L"\xE767";
-    case Control::capture: return L"\xE722";
-    case Control::timestamp: return L"\xE823";
-    case Control::renameStudio: return L"\xE8AC";
-    case Control::settings:return L"\xE713";
-    case Control::catalogSelect:return L"\xE739";
-    case Control::catalogReveal:return L"\xE8DA";
-    default: return {};
+    case Control::open:return Icon::folder;
+    case Control::catalog:return Icon::catalog;
+    case Control::info:return Icon::info;
+    case Control::exportGif:return Icon::exportFile;
+    case Control::more:return Icon::more;
+    case Control::previous:return Icon::first;
+    case Control::back:return Icon::chevronLeft;
+    case Control::play:return paused?Icon::play:Icon::pause;
+    case Control::step:return Icon::chevronRight;
+    case Control::next:return Icon::last;
+    case Control::zoom:return Icon::fit;
+    case Control::fullScreen:return fullscreen?Icon::restore:Icon::fullscreen;
+    case Control::pin:return Icon::pin;
+    case Control::promote:return Icon::openWindow;
+    case Control::close:return Icon::close;
+    case Control::panelPosition:return bottom?Icon::catalogBottom:Icon::catalogLeft;
+    case Control::volume:return Icon::volume;
+    case Control::capture:return Icon::camera;
+    case Control::timestamp:return Icon::timestamp;
+    case Control::renameStudio:return Icon::rename;
+    case Control::settings:return Icon::settings;
+    case Control::catalogSelect:return Icon::checkbox;
+    case Control::catalogReveal:return Icon::revealFile;
+    default:return Icon::none;
     }
 }
 
@@ -543,7 +545,6 @@ private:
     std::wstring status_;
     HFONT font_ = nullptr;
     HFONT titleFont_ = nullptr;
-    HFONT iconFont_ = nullptr;
     HBRUSH editBrush_ = nullptr;
     std::jthread exportThread_;
     ConversionResult exportResult_{};
@@ -567,7 +568,6 @@ App::~App()
     }
     if (font_) DeleteObject(font_);
     if (titleFont_) DeleteObject(titleFont_);
-    if (iconFont_) DeleteObject(iconFont_);
     if (editBrush_) DeleteObject(editBrush_);
 }
 
@@ -1191,13 +1191,10 @@ void App::updateFonts()
 {
     HFONT oldFont = font_;
     HFONT oldTitle = titleFont_;
-    HFONT oldIcon = iconFont_;
     font_ = CreateFontW(-dp(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     titleFont_ = CreateFontW(-dp(18), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    iconFont_ = CreateFontW(-dp(17), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, L"Segoe Fluent Icons");
     for (HWND button : buttons_) SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
     SendMessageW(rangeStart_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
     SendMessageW(rangeEnd_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
@@ -1206,7 +1203,6 @@ void App::updateFonts()
         SendMessageW(field,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,MAKELPARAM(dp(5),dp(5)));
     if (oldFont) DeleteObject(oldFont);
     if (oldTitle) DeleteObject(oldTitle);
-    if (oldIcon) DeleteObject(oldIcon);
 }
 
 void App::place(Control control, int x, int y, int width, int height, bool enabled)
@@ -1460,8 +1456,9 @@ void App::paintButton(const DRAWITEMSTRUCT& item)
     const bool primary = id == Control::play || id == Control::startExport;
     const bool card = id == Control::preset || id == Control::advanced || id == Control::copy ||
                       id == Control::cancel || id == Control::timestamp || primary;
-    const auto icon = id==Control::catalogSelect&&selectMode_?std::wstring_view(L"\xE73A"):id==Control::renameStudio?std::wstring_view{}:id == Control::volume && playback_.volume <= 0
-        ? std::wstring_view(L"\xE74F") : iconFor(id, playback_.paused, fullscreen_, panel_ == Panel::bottom);
+    const auto icon=id==Control::catalogSelect&&selectMode_?ui::Icon::checkboxChecked:
+        id==Control::renameStudio?ui::Icon::none:id==Control::volume&&playback_.volume<=0?ui::Icon::muted:
+        iconFor(id,playback_.paused,fullscreen_,panel_==Panel::bottom);
     const bool onStrip = id == Control::previous || id == Control::back || id == Control::play ||
                          id == Control::step || id == Control::next || id == Control::speed ||
                          id == Control::volume || id == Control::zoom || id == Control::fullScreen ||
@@ -1471,15 +1468,16 @@ void App::paintButton(const DRAWITEMSTRUCT& item)
         : active ? activeSurface : card || pressed || hover ? raised : base;
     fill(item.hDC, item.rcItem, base);
     rounded(item.hDC, item.rcItem, face, card && !primary ? border : face, dp(11));
-    const auto oldFont = SelectObject(item.hDC, icon.empty() ? font_ : iconFont_);
+    const auto oldFont = SelectObject(item.hDC,font_);
     wchar_t value[100]{};
-    if (icon.empty()) GetWindowTextW(item.hwndItem, value, static_cast<int>(std::size(value)));
+    if (icon==ui::Icon::none) GetWindowTextW(item.hwndItem, value, static_cast<int>(std::size(value)));
     const bool counter = id == Control::counter;
     RECT caption = item.rcItem;
     if (counter) caption.left += dp(4);
-    label(item.hDC, icon.empty() ? std::wstring_view(value) : icon, caption,
-          disabled ? hint : primary ? background : active ? accentHover : textColor,
-          (counter ? DT_LEFT : DT_CENTER) | DT_SINGLELINE | DT_VCENTER | (counter ? 0 : DT_END_ELLIPSIS));
+    const auto ink=disabled?hint:primary?background:active?accentHover:textColor;
+    if(icon!=ui::Icon::none) ui::drawIcon(item.hDC,caption,icon,ink,dpi_);
+    else label(item.hDC,value,caption,ink,
+        (counter?DT_LEFT:DT_CENTER)|DT_SINGLELINE|DT_VCENTER|(counter?0:DT_END_ELLIPSIS));
     SelectObject(item.hDC, oldFont);
     if (item.itemState & ODS_FOCUS) {
         RECT focus = item.rcItem;

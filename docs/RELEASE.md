@@ -4,21 +4,21 @@
 
 ## Portable beta
 
-Текущая версия `0.2.0-beta.7` исправляет пересчёт будущего имени после выбора художника из списка и повторение автора в автоматически подставляемом названии. Пример стандартного шаблона при пустом поле «Название»: `Author_title.png` → `Author_001_v01_title.png`. Подробности и границы распознавания приведены в [инструкции по художникам](ARTIST_REGISTRY.md); заметки выпуска — в точной секции версии [CHANGELOG.md](../CHANGELOG.md).
+Текущая версия `0.2.0-beta.8` убирает зависимость значков управления от системного шрифта иконок: они рисуются нативно через GDI. Установка дополнительных шрифтов не требуется. Работа с художниками описана в [инструкции по художникам](ARTIST_REGISTRY.md); заметки выпуска — в точной секции версии [CHANGELOG.md](../CHANGELOG.md).
 
 На машине с Visual Studio C++ x64 и Windows SDK:
 
 ```powershell
-cmake -S . -B build-release -G "Visual Studio 17 2022" -A x64 "-DVIEWERY_VERSION=0.2.0-beta.7" -DVIEWERY_MEDIA_TESTS=ON
+cmake -S . -B build-release -G "Visual Studio 17 2022" -A x64 "-DVIEWERY_VERSION=0.2.0-beta.8" -DVIEWERY_MEDIA_TESTS=ON
 cmake --build build-release --config Release --parallel
 ./scripts/Get-MediaTools.ps1 -Destination build-release/bin/Release -IncludeProbe
 ctest --test-dir build-release -C Release --output-on-failure
-./scripts/Build-Release.ps1 -BuildDirectory build-release/bin/Release -Destination dist -Version '0.2.0-beta.7'
+./scripts/Build-Release.ps1 -BuildDirectory build-release/bin/Release -Destination dist -Version '0.2.0-beta.8'
 ```
 
-Пакет `Viewery-0.2.0-beta.7-Windows-x64-portable.zip` содержит только приложение, shell DLL, README, CHANGELOG, инструкции, лицензии и скрипт с проверяемыми SHA-256. Пользователь распаковывает пакет в постоянный каталог, запускает `Viewery.exe` и выбирает установку медиакомпонентов в меню. Для классического ПКМ и фонового Quick View запустите скрипт интеграции Проводника по инструкции README. Компоненты устанавливаются в `%LOCALAPPDATA%\Viewery\MediaTools`, данные коллекции — в `%LOCALAPPDATA%\Viewery`, настройки — в `HKCU\Software\Viewery`.
+Пакет `Viewery-0.2.0-beta.8-Windows-x64-portable.zip` содержит только приложение, shell DLL, README, CHANGELOG, инструкции, лицензии и скрипт с проверяемыми SHA-256. Пользователь распаковывает пакет в постоянный каталог, запускает `Viewery.exe` и выбирает установку медиакомпонентов в меню. Для классического ПКМ и фонового Quick View запустите скрипт интеграции Проводника по инструкции README. Компоненты устанавливаются в `%LOCALAPPDATA%\Viewery\MediaTools`, данные коллекции — в `%LOCALAPPDATA%\Viewery`, настройки — в `HKCU\Software\Viewery`.
 
-Аргументы CMake с номером версии передавайте целиком в кавычках, включая `"-DCMAKE_SYSTEM_VERSION=10.0.26100.0"` при явном выборе SDK. Иначе PowerShell может передать неполное значение. CMake проверяет формат версии приложения и диапазон компонентов MSIX `0..65535`; неверный кеш исправляется повторной конфигурацией с `"-DVIEWERY_VERSION=0.2.0-beta.7"` до сборки и упаковки.
+Аргументы CMake с номером версии передавайте целиком в кавычках, включая `"-DCMAKE_SYSTEM_VERSION=10.0.26100.0"` при явном выборе SDK. Иначе PowerShell может передать неполное значение. CMake проверяет формат версии приложения и диапазон компонентов MSIX `0..65535`; неверный кеш исправляется повторной конфигурацией с `"-DVIEWERY_VERSION=0.2.0-beta.8"` до сборки и упаковки.
 
 Portable проверяет наличие версии и показывает заметки релиза. Автоматическая замена portable EXE не выполняется. Установка обновления из приложения доступна для подписанной версии, установленной через `.appinstaller`.
 
@@ -29,7 +29,7 @@ Portable проверяет наличие версии и показывает 
 3. Для локальной сборки сертификат должен быть доступен в `Cert:\CurrentUser\My`. Передать его thumbprint:
 
 ```powershell
-./scripts/Build-Release.ps1 -BuildDirectory build-release/bin/Release -Destination dist-signed -Version '0.2.0-beta.7' -SigningThumbprint YOUR_40_DIGIT_THUMBPRINT
+./scripts/Build-Release.ps1 -BuildDirectory build-release/bin/Release -Destination dist-signed -Version '0.2.0-beta.8' -SigningThumbprint YOUR_40_DIGIT_THUMBPRINT
 ```
 
 Скрипт подписывает и проверяет EXE, shell DLL и MSIX через SignTool с SHA-256 и RFC 3161 timestamp. Он сохраняет подпись в готовом portable ZIP и генерирует рабочий `Viewery.appinstaller` только после успешной подписи. MakeAppx выполняет проверку схемы и содержимого, `/nv` не используется. При отсутствии сертификата создаются `.unsigned.msix` и `.appinstaller.template.xml`.
@@ -50,7 +50,7 @@ Portable проверяет наличие версии и показывает 
 
 После успешной подписи workflow также публикует:
 
-- Неизменяемый пакет `releases/download/v0.2.0-beta.7/Viewery-0.2.0-beta.7-x64.msix`.
+- Неизменяемый пакет `releases/download/v0.2.0-beta.8/Viewery-0.2.0-beta.8-x64.msix`.
 - Канал `releases/download/updates-beta/Viewery.appinstaller` либо `updates-stable`.
 
 GitHub `latest` не используется для beta. Канальный релиз содержит только текущий AppInstaller; содержимое `.appinstaller` указывает на конкретную подписанную версию. Канальный тег не является семантической версией и игнорируется проверкой наличия обновления.
