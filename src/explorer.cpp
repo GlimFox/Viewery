@@ -1,4 +1,5 @@
 #include "explorer.hpp"
+#include "quick_space.hpp"
 
 #include <oleauto.h>
 #include <exdisp.h>
@@ -11,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <future>
 #include <mutex>
 #include <optional>
@@ -28,6 +30,7 @@ constexpr wchar_t settings_key[] = L"Software\\Viewery";
 constexpr wchar_t hotkey_value[] = L"PreviewHotkey";
 constexpr UINT preview_message = WM_APP + 0x475;
 constexpr UINT follow_message = WM_APP + 0x476;
+constexpr UINT quick_space_message = WM_APP + 0x477;
 constexpr int hotkey_probe_id = 0x4a57;
 constexpr auto inspection_budget = 150ms;
 constexpr DWORD follow_interval_ms = 180;
@@ -375,14 +378,22 @@ struct ExplorerIntegration::Impl {
         FocusTarget target;
         std::filesystem::path path;
     };
+    struct SpaceRequest {
+        FocusTarget target;
+        std::uint64_t timestamp = 0;
+        std::uint64_t generation = 0;
+    };
 
-    Impl(HWND owner, PreviewCallback open, SupportsFile supports, PreviewCallback follow)
+    Impl(HWND owner, PreviewCallback open, SupportsFile supports, PreviewCallback follow, QuickSpaceCallback quick)
         : owner(owner), open_preview(std::move(open)), supports_file(std::move(supports)),
-          follow_selection(std::move(follow)) {}
+          follow_selection(std::move(follow)), quick_space(std::move(quick)) {}
 
     ~Impl() { stop_hook(); }
 
     void stop_hook() {
+        preview_active = false;
+        preview_frame = nullptr;
+        ++preview_generation;
         if (hook_thread.joinable()) {
             PostThreadMessageW(hook_thread_id, WM_QUIT, 0, 0);
             hook_thread.join();
@@ -393,10 +404,25 @@ struct ExplorerIntegration::Impl {
         inspection.reset();
         space_down = false;
         space_consumed = false;
-        preview.reset();
+        {
+            std::lock_guard lock(preview_mutex);
+            preview.reset();
+            spaces.clear();
+        }
         follow_enabled = false;
         source_frame = nullptr;
         source_path.clear();
+    }
+
+    void set_preview_active(bool enabled) {
+        const HWND frame = enabled ? source_frame : nullptr;
+        const bool activity_changed = preview_active.exchange(enabled) != enabled;
+        const bool frame_changed = preview_frame.exchange(frame) != frame;
+        if (activity_changed || frame_changed) {
+            ++preview_generation;
+            std::lock_guard lock(preview_mutex);
+            spaces.clear();
+        }
     }
 
     bool start() {
@@ -461,16 +487,33 @@ struct ExplorerIntegration::Impl {
         if (message != WM_KEYDOWN && message != WM_SYSKEYDOWN) return false;
         if (std::exchange(space_down, true)) return space_consumed;
         const auto shortcut = active_hotkey.load();
-        if (!matches(shortcut, key)) return false;
+        const bool opening_chord = matches(shortcut, key);
+        const bool plain_space = matches(PreviewHotkey::space, key);
+        const bool active = preview_active.load() && static_cast<bool>(quick_space);
+        if (!opening_chord && !(active && plain_space)) return false;
 
         const auto target = explorer_focus();
         if (!target || !inspection) return false;
+        const bool same_explorer = target->frame == preview_frame.load();
+        if (!opening_chord && !same_explorer) return false;
+        const auto generation = preview_generation.load();
+        const auto timestamp = GetTickCount64();
         auto path = inspection->request(*target);
         if (!path || !supports_file(*path) || shortcut != active_hotkey.load() || explorer_focus() != target) {
             return false;
         }
 
+        const auto route = routeQuickSpace({opening_chord, plain_space, active, same_explorer, true});
         std::lock_guard lock(preview_mutex);
+        if (route == QuickSpaceRoute::controlPreview) {
+            if (!preview_active.load() || generation != preview_generation.load() ||
+                target->frame != preview_frame.load() || spaces.size() >= 8) return false;
+            spaces.push_back({*target, timestamp, generation});
+            space_consumed = PostMessageW(owner, quick_space_message, 0, 0) != FALSE;
+            if (!space_consumed) spaces.pop_back();
+            return space_consumed;
+        }
+        if (route != QuickSpaceRoute::openPreview) return false;
         if (preview) return false;
         preview = PreviewRequest{*target, std::move(*path)};
         space_consumed = PostMessageW(owner, preview_message, 0, 0) != FALSE;
@@ -482,6 +525,7 @@ struct ExplorerIntegration::Impl {
     PreviewCallback open_preview;
     SupportsFile supports_file;
     PreviewCallback follow_selection;
+    QuickSpaceCallback quick_space;
     std::shared_ptr<FocusInspection> inspection;
     std::thread hook_thread;
     DWORD hook_thread_id = 0;
@@ -490,6 +534,10 @@ struct ExplorerIntegration::Impl {
     bool space_consumed = false;
     std::mutex preview_mutex;
     std::optional<PreviewRequest> preview;
+    std::deque<SpaceRequest> spaces;
+    std::atomic_bool preview_active = false;
+    std::atomic<HWND> preview_frame = nullptr;
+    std::atomic<std::uint64_t> preview_generation = 0;
     bool follow_enabled = false;
     HWND source_frame = nullptr;
     std::filesystem::path source_path;
@@ -499,9 +547,9 @@ struct ExplorerIntegration::Impl {
 thread_local ExplorerIntegration::Impl* ExplorerIntegration::Impl::instance = nullptr;
 
 ExplorerIntegration::ExplorerIntegration(HWND owner, PreviewCallback open_preview, SupportsFile supports_file,
-                                         PreviewCallback follow_selection)
+                                         PreviewCallback follow_selection, QuickSpaceCallback quick_space)
     : impl_(std::make_unique<Impl>(owner, std::move(open_preview), std::move(supports_file),
-                                  std::move(follow_selection))) {}
+                                  std::move(follow_selection), std::move(quick_space))) {}
 
 ExplorerIntegration::~ExplorerIntegration() = default;
 
@@ -510,6 +558,23 @@ bool ExplorerIntegration::start() {
 }
 
 bool ExplorerIntegration::handle_message(UINT message, WPARAM, LPARAM) {
+    if (message == quick_space_message) {
+        std::optional<Impl::SpaceRequest> press;
+        {
+            std::lock_guard lock(impl_->preview_mutex);
+            if (!impl_->spaces.empty()) {
+                press = impl_->spaces.front();
+                impl_->spaces.pop_front();
+            }
+        }
+        if (press && impl_->quick_space && impl_->preview_active.load() &&
+            press->generation == impl_->preview_generation.load() &&
+            press->target.frame == impl_->preview_frame.load() &&
+            GetTickCount64() - press->timestamp <= 2000 && explorer_focus() == press->target) {
+            impl_->quick_space(press->timestamp);
+        }
+        return true;
+    }
     if (message == follow_message) {
         if (!impl_->follow_enabled || !impl_->inspection) return true;
         const auto path = impl_->inspection->take_followed_file();
@@ -551,6 +616,7 @@ bool ExplorerIntegration::set_hotkey(PreviewHotkey shortcut) {
 }
 
 void ExplorerIntegration::set_follow_selection(bool enabled) {
+    set_preview_active(enabled);
     const bool follow = enabled && impl_->follow_selection && source_explorer();
     if (std::exchange(impl_->follow_enabled, follow) != follow && impl_->inspection) {
         impl_->inspection->follow(follow ? impl_->source_frame : nullptr,
@@ -560,6 +626,10 @@ void ExplorerIntegration::set_follow_selection(bool enabled) {
         impl_->source_frame = nullptr;
         impl_->source_path.clear();
     }
+}
+
+void ExplorerIntegration::set_preview_active(bool enabled) {
+    impl_->set_preview_active(enabled);
 }
 
 HWND ExplorerIntegration::source_explorer() const {

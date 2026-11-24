@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -14,9 +15,10 @@ class ExplorerIntegration {
 public:
     using PreviewCallback = std::function<void(const std::filesystem::path&)>;
     using SupportsFile = std::function<bool(const std::filesystem::path&)>;
+    using QuickSpaceCallback = std::function<void(std::uint64_t)>;
 
     ExplorerIntegration(HWND owner, PreviewCallback open_preview, SupportsFile supports_file,
-                        PreviewCallback follow_selection = {});
+                        PreviewCallback follow_selection = {}, QuickSpaceCallback quick_space = {});
     ~ExplorerIntegration();
 
     ExplorerIntegration(const ExplorerIntegration&) = delete;
@@ -27,6 +29,7 @@ public:
     PreviewHotkey hotkey() const;
     bool set_hotkey(PreviewHotkey hotkey);
     void set_follow_selection(bool enabled);
+    void set_preview_active(bool enabled);
     HWND source_explorer() const;
 
 private:

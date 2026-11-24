@@ -2,6 +2,7 @@
 #include "rename_template.hpp"
 
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <shobjidl.h>
 #include <uxtheme.h>
 #include <windowsx.h>
@@ -20,6 +21,8 @@ namespace viewery {
 namespace {
 namespace fs = std::filesystem;
 constexpr UINT finished = WM_APP + 431;
+constexpr UINT validateQueueMessage = WM_APP + 432;
+constexpr UINT deferredUiMessage = WM_APP + 433;
 constexpr COLORREF bg = RGB(23,26,33), fg = RGB(241,242,247), muted = RGB(149,155,170);
 constexpr COLORREF accent = RGB(155,140,255), inputColor = RGB(36,40,52);
 enum Id {
@@ -30,7 +33,8 @@ enum Id {
     blockPrefix, blockSuffix, blockFallback, blockCase, blockApply, authorJoin,
     counterStart, counterScope, previewList, previewSearch, newName, editName, makePreview,
     apply, historyList, undo, recover, cancelTask, dbBackup, metaExport, metaImport, historyDetails,
-    closePanel, advancedToggle, presetMenu, liveExample, scrollViewport, scrollContent, newPreset
+    closePanel, advancedToggle, presetMenu, liveExample, scrollViewport, scrollContent, newPreset,
+    dataAdvanced, queueRemove, queueClear, batchPresetName
 };
 std::wstring text(HWND control) {
     std::wstring result(static_cast<std::size_t>(GetWindowTextLengthW(control))+1,L'\0');
@@ -110,7 +114,7 @@ void fill(HDC dc,RECT rect,COLORREF color) {
 }
 
 struct RenameStudio::Impl {
-    HWND owner=nullptr,window=nullptr,viewport=nullptr,content=nullptr,tips=nullptr;
+    HWND owner=nullptr,window=nullptr,viewport=nullptr,content=nullptr,tips=nullptr,editorHost=nullptr;
     UINT changed=0,dpi=96;
     HFONT font=nullptr;
     HBRUSH brush=CreateSolidBrush(bg),editBrush=CreateSolidBrush(inputColor);
@@ -119,6 +123,14 @@ struct RenameStudio::Impl {
     int tab=0,dragBlock=-1,scrollOffset=0,scrollLimit=0,contentHeight=0;
     POINT dragOrigin{};
     bool filling=false,indexPending=false,layingOut=false,dragging=false,advanced=false;
+    bool templateOnly=false,dataExpanded=false;
+    int deferredUiAction=0;
+    bool deferredUiPosted=false;
+    Impl* templateParent=nullptr;
+    std::unique_ptr<Impl> editor;
+    HFONT editorFont=nullptr;
+    RECT shownBounds{};
+    bool hasShownBounds=false;
     std::size_t captionIndex=0;
     std::uint64_t selectionGeneration=0,directoryGeneration=0;
     std::vector<fs::path> directory,selection,indexed;
@@ -139,10 +151,10 @@ struct RenameStudio::Impl {
     std::wstring tooltipText;
     int dp(int value) const { return MulDiv(value,static_cast<int>(dpi),96); }
     HWND c(int id) const { const auto found=controls.find(id);return found==controls.end()?nullptr:found->second; }
-    bool busy() const { return worker.joinable(); }
+    bool busy() const { return worker.joinable()||(editor&&editor->worker.joinable()); }
 
-    Impl(HWND parent,UINT msg,BeforeFilesChange callback,fs::path databasePath)
-        :owner(parent),changed(msg),database(std::move(databasePath)),before(std::move(callback)) {
+    Impl(HWND parent,UINT msg,BeforeFilesChange callback,fs::path databasePath,bool onlyTemplate=false)
+        :owner(parent),changed(msg),templateOnly(onlyTemplate),database(std::move(databasePath)),before(std::move(callback)) {
         try {
             const INITCOMMONCONTROLSEX common{sizeof(common),ICC_LISTVIEW_CLASSES};
             if(!InitCommonControlsEx(&common)) throw LibraryError("Cannot initialize native collection controls");
@@ -181,6 +193,9 @@ struct RenameStudio::Impl {
         }
     }
     ~Impl() {
+        editor.reset();
+        if(editorHost) DestroyWindow(editorHost);
+        if(editorFont) DeleteObject(editorFont);
         worker.request_stop();
         if(worker.joinable()) worker.join();
         if(window) DestroyWindow(window);
@@ -230,16 +245,16 @@ struct RenameStudio::Impl {
         ListView_InsertColumn(c(id),index,&col);
     }
     void build() {
-        button(tabAssign,L"Данные");button(tabTemplate,L"Шаблон");
-        button(tabPreview,L"Имена");button(tabHistory,L"История");
+        button(tabAssign,L"Пачка");button(tabTemplate,L"Шаблоны…");
+        button(tabPreview,L"Очередь");button(tabHistory,L"История");
         button(closePanel,L"Закрыть");
         create(summary,L"STATIC",L"Выбрано 0 файлов",0);
         create(status,L"STATIC",L"",SS_LEFT);
         combo(artist,true);combo(work,true);edit(title);
         edit(workNumber);edit(versionNumber,L"1");
-        combo(assignment);item(assignment,L"Отдельная работа для каждого файла");
-        item(assignment,L"Версии одной новой работы");item(assignment,L"Добавить к существующей работе");
-        item(assignment,L"Только назначить художника");
+        combo(assignment);item(assignment,L"Разные работы");
+        item(assignment,L"Версии одной работы");item(assignment,L"К существующей работе");
+        item(assignment,L"Только художник");
         SendMessageW(c(assignment),CB_SETCURSEL,0,0);
         edit(aliases);edit(fields,L"",ES_MULTILINE|ES_WANTRETURN|WS_VSCROLL);
         button(assign,L"Назначить выбранным");
@@ -273,6 +288,9 @@ struct RenameStudio::Impl {
         column(historyList,0,L"Время",150);column(historyList,1,L"Состояние",100);column(historyList,2,L"Файлов",65);
         edit(historyDetails,L"",ES_MULTILINE|ES_READONLY|WS_VSCROLL);
         button(undo,L"Отменить операцию");button(recover,L"Восстановить");button(cancelTask,L"Отменить задачу");
+        button(dataAdvanced,L"Дополнительные данные  ▾");
+        button(queueRemove,L"Убрать строку");button(queueClear,L"Очистить очередь");
+        create(batchPresetName,L"STATIC",L"",SS_LEFT|SS_ENDELLIPSIS);
         fillBlocks();fillGlobals();
     }
     bool dropdownOpen() const {
@@ -281,7 +299,126 @@ struct RenameStudio::Impl {
         }
         return false;
     }
-    void close() { PostMessageW(owner,WM_COMMAND,RenameStudio::closeCommandId,0); }
+    void close() {deferredUiAction=0;PostMessageW(owner,WM_COMMAND,RenameStudio::closeCommandId,0);}
+    void scheduleDeferredUi() {
+        if(deferredUiAction&&!deferredUiPosted&&!busy()&&!indexPending&&directory==indexed) {
+            deferredUiPosted=PostMessageW(window,deferredUiMessage,0,0)!=FALSE;
+        }
+    }
+    bool postponeUi(int action) {
+        if(!busy()&&!indexPending&&directory==indexed) return false;
+        deferredUiAction=action;
+        SetWindowTextW(c(status),L"Откроется после подготовки коллекции…");
+        if(!busy()) beginIndex();
+        return true;
+    }
+    void cancelJobs() {
+        deferredUiAction=0;worker.request_stop();
+        if(templateParent) templateParent->deferredUiAction=0;
+        if(editor) {editor->deferredUiAction=0;editor->worker.request_stop();}
+    }
+    static LRESULT CALLBACK editorProcedure(HWND hwnd,UINT msg,WPARAM w,LPARAM l) {
+        auto* self=reinterpret_cast<Impl*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));
+        if(msg==WM_NCCREATE) {
+            self=static_cast<Impl*>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);
+            SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(self));
+        }
+        if(!self) return DefWindowProcW(hwnd,msg,w,l);
+        if(msg==WM_SIZE&&self->editor) {self->sizeEditor();return 0;}
+        if(msg==WM_DPICHANGED) {
+            const auto bounds=*reinterpret_cast<RECT*>(l);
+            SetWindowPos(hwnd,nullptr,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,
+                SWP_NOZORDER|SWP_NOACTIVATE);
+            self->sizeEditor();return 0;
+        }
+        if(msg==WM_GETMINMAXINFO) {
+            auto& limits=*reinterpret_cast<MINMAXINFO*>(l);
+            const UINT scale=GetDpiForWindow(hwnd);
+            limits.ptMinTrackSize={MulDiv(440,static_cast<int>(scale),96),MulDiv(430,static_cast<int>(scale),96)};
+            return 0;
+        }
+        if(msg==WM_CLOSE||(msg==WM_COMMAND&&LOWORD(w)==RenameStudio::closeCommandId)) {
+            if(self->deferredUiAction==tabTemplate) self->deferredUiAction=0;
+            ShowWindow(hwnd,SW_HIDE);return 0;
+        }
+        if(msg==self->changed&&self->editor) {
+            self->syncTemplateFromEditor();
+            self->layout();
+            PostMessageW(self->owner,self->changed,0,0);
+            if(self->indexPending&&!self->busy()) self->beginIndex();
+            self->scheduleDeferredUi();
+            return 0;
+        }
+        return DefWindowProcW(hwnd,msg,w,l);
+    }
+    void setFont(HFONT value,UINT scale) {
+        dpi=scale;font=value;
+        for(const auto& [id,control]:controls) {
+            (void)id;SendMessageW(control,WM_SETFONT,reinterpret_cast<WPARAM>(font),FALSE);
+        }
+        SendMessageW(c(blocks),LB_SETITEMHEIGHT,0,dp(32));
+        for(int id:{assignment,blockKind,blockCase,counterScope}) {
+            SendMessageW(c(id),CB_SETITEMHEIGHT,static_cast<WPARAM>(-1),dp(22));
+            SendMessageW(c(id),CB_SETITEMHEIGHT,0,dp(26));
+        }
+    }
+    void sizeEditor() {
+        if(!editor||!editorHost) return;
+        const UINT scale=GetDpiForWindow(editorHost);
+        if(!editorFont||editor->dpi!=scale) {
+            const HFONT next=CreateFontW(-MulDiv(14,static_cast<int>(scale),96),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
+                DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,0,L"Segoe UI");
+            editor->setFont(next,scale);
+            if(editorFont) DeleteObject(editorFont);
+            editorFont=next;
+        }
+        RECT area{};GetClientRect(editorHost,&area);
+        SetWindowPos(editor->window,nullptr,0,0,area.right,area.bottom,SWP_NOZORDER|SWP_NOACTIVATE|SWP_SHOWWINDOW);
+        editor->layout();
+    }
+    void syncTemplateFromEditor() {
+        if(!editor) return;
+        naming=editor->naming;
+        naming.authorSeparator=text(editor->c(authorJoin));
+        naming.counterStart=integer(editor->c(counterStart),1);
+        const auto scope=SendMessageW(editor->c(counterScope),CB_GETCURSEL,0,0);
+        if(scope>=0) naming.counterScope=static_cast<CounterScope>(scope);
+        if(!editor->worker.joinable()) {
+            if(!store&&editor->store) {store=editor->store;data=editor->data;}
+            presets=editor->presets;
+        }
+        fillGlobals();
+        SetWindowTextW(c(batchPresetName),naming.name.c_str());
+        updateExample();
+    }
+    void openEditor() {
+        if(templateOnly||postponeUi(tabTemplate)) return;
+        if(!editorHost) {
+            static const ATOM klass=[] {
+                WNDCLASSW wc{};wc.hInstance=GetModuleHandleW(nullptr);wc.lpfnWndProc=editorProcedure;
+                wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.lpszClassName=L"Viewery.TemplateEditor.1";
+                return RegisterClassW(&wc);
+            }();
+            if(!klass) throw LibraryError("Cannot register template editor");
+            editorHost=CreateWindowExW(WS_EX_CONTROLPARENT,L"Viewery.TemplateEditor.1",L"Шаблоны имён",
+                WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,dp(570),dp(790),owner,
+                nullptr,GetModuleHandleW(nullptr),this);
+            if(!editorHost) throw LibraryError("Cannot open template editor");
+            const BOOL dark=TRUE;
+            DwmSetWindowAttribute(editorHost,DWMWA_USE_IMMERSIVE_DARK_MODE,&dark,sizeof(dark));
+            editor=std::make_unique<Impl>(editorHost,changed,BeforeFilesChange{},database,true);
+            editor->templateParent=this;
+            editor->tab=1;
+            SetWindowSubclass(editor->c(blocks),blocksProc,1,reinterpret_cast<DWORD_PTR>(editor.get()));
+        }
+        editor->data=data;editor->presets=presets;editor->naming=naming;editor->selection=selection;
+        editor->directory=directory;editor->indexed=indexed;editor->store=store;
+        editor->fillMetadata();editor->fillPresets();editor->fillBlocks();editor->fillGlobals();editor->selectBlock();
+        SetWindowTextW(editor->c(summary),L"Шаблоны имён");
+        sizeEditor();
+        ShowWindow(editorHost,SW_SHOWNORMAL);SetForegroundWindow(editorHost);
+        if(!editor->store) editor->beginIndex();
+    }
     void scrollTo(int value) {
         if(dropdownOpen()) return;
         const int next=std::clamp(value,0,scrollLimit);
@@ -321,9 +458,12 @@ struct RenameStudio::Impl {
         RECT rect{};GetClientRect(window,&rect);
         const int width=MulDiv(rect.right,96,static_cast<int>(dpi));
         const int height=MulDiv(rect.bottom,96,static_cast<int>(dpi));
-        const int bodyHeight=std::max(1,height-132);
-        SetWindowPos(viewport,nullptr,0,dp(82),rect.right,dp(bodyHeight),SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW);
-        contentHeight=tab==0?612:tab==1?(advanced?910:582):tab==2?std::max(460,bodyHeight):std::max(440,bodyHeight);
+        const int bodyTop=templateOnly?46:82;
+        const int bodyHeight=std::max(1,height-bodyTop-50);
+        const auto assignmentMode=SendMessageW(c(assignment),CB_GETCURSEL,0,0);
+        const bool existingWork=assignmentMode==2,artistOnly=assignmentMode==3;
+        SetWindowPos(viewport,nullptr,0,dp(bodyTop),rect.right,dp(bodyHeight),SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW);
+        contentHeight=tab==0?(dataExpanded?827:447)+(existingWork?62:0)-(artistOnly?62:0):tab==1?(advanced?910:582):tab==2?std::max(510,bodyHeight):std::max(440,bodyHeight);
         scrollLimit=std::max(0,contentHeight-bodyHeight);
         scrollOffset=std::clamp(scrollOffset,0,scrollLimit);
         SCROLLINFO scroll{sizeof(scroll),SIF_RANGE|SIF_PAGE|SIF_POS};
@@ -341,28 +481,38 @@ struct RenameStudio::Impl {
         }
         put(summary,12,12,std::max(1,width-112),23);
         put(closePanel,std::max(12,width-94),7,82,31);
-        const int tabWidth=std::max(1,(width-33)/4);
-        for(int index=0;index<4;++index) put(tabAssign+index,12+index*(tabWidth+3),43,tabWidth,29);
+        if(!templateOnly) {
+            const int tabWidth=std::max(1,(width-33)/4);
+            for(int index=0;index<4;++index) put(tabAssign+index,12+index*(tabWidth+3),43,tabWidth,29);
+        }
         put(status,12,std::max(0,height-42),std::max(1,width-(busy()?150:24)),38);
         if(busy()) put(cancelTask,std::max(12,width-132),std::max(0,height-39),120,30);
         if(tab==0) {
-            caption(L"Художник · соавторов разделяйте ;",12,6,inside);
+            caption(L"Художник",12,6,inside);
             put(artist,12,29,inside,210);
-            caption(L"Что сделать с выбранными файлами",12,68,inside);
-            put(assignment,12,91,inside,180);
-            caption(L"Существующая работа",12,130,inside);
-            put(work,12,153,inside,210);
-            caption(L"Название работы",12,192,inside);put(title,12,215,inside);
-            const int half=(inside-12)/2;
-            caption(L"№ работы · авто",12,255,half);
-            caption(L"Первая версия",24+half,255,half);
-            put(workNumber,12,278,half);put(versionNumber,24+half,278,half);
-            caption(L"Псевдонимы художника",12,318,inside);put(aliases,12,341,inside);
-            caption(L"Поля файлов · ключ=значение",12,381,inside);
-            put(fields,12,404,inside,73);
-            put(assign,12,490,inside,34);
-            const int third=(inside-12)/3;
-            put(dbBackup,12,538,third);put(metaExport,18+third,538,third);put(metaImport,24+third*2,538,third);
+            int y=68;
+            if(!artistOnly) {caption(L"Название · пусто — исходное имя",12,y,inside);put(title,12,y+23,inside);y+=62;}
+            caption(L"Выбранные файлы — это",12,y,inside);put(assignment,12,y+23,inside,180);y+=62;
+            const wchar_t* explanation=assignmentMode==1?L"Одно название · версии v01, v02…":assignmentMode==2?L"Продолжить выбранную работу":
+                artistOnly?L"Сохранить номера и названия работ":L"У каждого файла свой номер работы";
+            caption(explanation,12,y,inside);y+=22;
+            if(existingWork) {caption(L"Выберите работу",12,y,inside);put(work,12,y+23,inside,210);y+=62;}
+            caption(L"Шаблон · редактируется в отдельном окне",12,y,inside);
+            put(batchPresetName,12,y+23,inside,25);y+=62;
+            caption(L"Пример будущего имени",12,y,inside);put(liveExample,12,y+23,inside,34);y+=68;
+            put(makePreview,12,y,inside,34);SetWindowTextW(c(makePreview),L"Добавить пачку в очередь");y+=46;
+            put(dataAdvanced,12,y,inside);y+=42;
+            SetWindowTextW(c(dataAdvanced),dataExpanded?L"Дополнительные данные  ▴":L"Дополнительные данные  ▾");
+            if(dataExpanded) {
+                const int half=(inside-12)/2;
+                caption(L"№ работы · авто",12,y,half);caption(L"Первая версия",24+half,y,half);
+                put(workNumber,12,y+23,half);put(versionNumber,24+half,y+23,half);y+=62;
+                caption(L"Псевдонимы художника",12,y,inside);put(aliases,12,y+23,inside);y+=62;
+                caption(L"Поля файлов · ключ=значение",12,y,inside);put(fields,12,y+23,inside,73);y+=108;
+                put(assign,12,y,inside,34);SetWindowTextW(c(assign),L"Сохранить только данные");y+=46;
+                const int third=(inside-12)/3;
+                put(dbBackup,12,y,third);put(metaExport,18+third,y,third);put(metaImport,24+third*2,y,third);
+            }
         } else if(tab==1) {
             caption(L"Пресет · выберите или введите своё имя",12,6,inside);
             put(preset,12,29,std::max(1,inside-146),210);
@@ -399,17 +549,17 @@ struct RenameStudio::Impl {
                 caption(L"Область счётчика",12,y,inside);put(counterScope,12,y+23,inside,160);y+=62;
             }
             put(makePreview,12,y,inside,34);
-            SetWindowTextW(c(makePreview),L"Проверить будущие имена →");
+            SetWindowTextW(c(makePreview),L"Использовать этот шаблон");
             SetWindowTextW(c(advancedToggle),advanced?L"Дополнительные параметры  ▴":L"Дополнительные параметры  ▾");
         } else if(tab==2) {
-            caption(L"Поиск по исходному или новому имени",12,6,inside);
+            caption(L"Пачки готовы · проверьте имена перед запуском",12,6,inside);
             put(previewSearch,12,29,inside);
-            const int listHeight=std::max(146,contentHeight-252);
+            const int listHeight=std::max(146,contentHeight-296);
             put(previewList,12,70,inside,listHeight);
             caption(L"Новое имя выбранной строки",12,82+listHeight,inside);
             put(newName,12,105+listHeight,std::max(1,inside-116));put(editName,bodyWidth-120,105+listHeight,108);
-            put(makePreview,12,147+listHeight,(inside-8)/2,34);put(apply,20+(inside-8)/2,147+listHeight,(inside-8)/2,34);
-            SetWindowTextW(c(makePreview),L"Обновить имена");
+            put(queueRemove,12,147+listHeight,(inside-8)/2);put(queueClear,20+(inside-8)/2,147+listHeight,(inside-8)/2);
+            put(apply,12,189+listHeight,inside,34);SetWindowTextW(c(apply),L"Переименовать всю очередь");
         } else {
             const int listHeight=std::max(140,contentHeight-248);
             put(historyList,12,6,inside,listHeight);
@@ -439,6 +589,7 @@ struct RenameStudio::Impl {
         LibraryId savedPresetId;
         std::optional<std::wstring> operationDetails;
         std::optional<std::pair<std::uint64_t,std::uint64_t>> previewGeneration;
+        bool replaceQueue=false,clearQueue=false,batchAdded=false;
     } pending;
     bool startJob(std::function<void(CollectionStore&,std::stop_token)> task,std::wstring message) {
         if(busy()) return false;
@@ -488,27 +639,49 @@ struct RenameStudio::Impl {
         data=std::move(pending.snapshot);
         presets=std::move(pending.presets);
         operations=std::move(pending.history);
-        if(pending.previewGeneration&&pending.previewGeneration->first==selectionGeneration&&
-            pending.previewGeneration->second==directoryGeneration) preview=std::move(pending.preview);
+        if(pending.replaceQueue||(pending.previewGeneration&&pending.previewGeneration->first==selectionGeneration&&
+            pending.previewGeneration->second==directoryGeneration)) preview=std::move(pending.preview);
         if(!pending.savedPresetId.empty()) naming.id=std::move(pending.savedPresetId);
         if(pending.operationDetails) SetWindowTextW(c(historyDetails),pending.operationDetails->c_str());
-        if(pending.files) fileResult=std::move(pending.files);
+        if(pending.clearQueue) preview.clear();
+        if(pending.batchAdded) {
+            const bool wasFilling=std::exchange(filling,true);
+            SetWindowTextW(c(title),L"");SetWindowTextW(c(workNumber),L"");
+            filling=wasFilling;
+        }
+        if(pending.files) {
+            if(!pending.clearQueue&&pending.files->success) {
+                for(auto& row:preview) for(const auto& [source,target]:pending.files->changes) {
+                    if(CompareStringOrdinal(row.proposal.source.c_str(),-1,source.c_str(),-1,TRUE)==CSTR_EQUAL) row.proposal.source=target;
+                }
+            }
+            fileResult=std::move(pending.files);
+        }
         SetWindowTextW(c(status),pending.message.c_str());
         fillMetadata();
         fillPresets();
         fillPreview();
         fillHistory();
+        updateSummary();updateExample();
+        if(templateParent) templateParent->syncTemplateFromEditor();
+        if(editor&&!editor->busy()) {editor->data=data;editor->presets=presets;editor->selection=selection;editor->fillMetadata();editor->fillPresets();editor->updateExample();}
         PostMessageW(owner,changed,0,0);
         layout();
-        if(!cancelled&&(indexPending||directory!=indexed)) beginIndex();
+        if((!cancelled||deferredUiAction)&&(indexPending||directory!=indexed)) beginIndex();
+        scheduleDeferredUi();
     }
     void updateSelection(std::vector<fs::path> selected) {
         ++selectionGeneration;
         selection=std::move(selected);
-        const auto value=L"Выбрано файлов   "+std::to_wstring(selection.size());
-        SetWindowTextW(c(summary),value.c_str());
-        preview.clear();fillPreview();
+        updateSummary();
+        if(editor) {editor->selection=selection;editor->data=data;editor->updateExample();}
         updateExample();
+    }
+    void updateSummary() {
+        const auto value=templateOnly?L"Шаблоны имён":L"Выбрано "+std::to_wstring(selection.size())+
+            L" · в очереди "+std::to_wstring(preview.size());
+        SetWindowTextW(c(summary),value.c_str());
+        SetWindowTextW(c(batchPresetName),naming.name.c_str());
     }
     void fillMetadata() {
         filling=true;
@@ -600,12 +773,66 @@ struct RenameStudio::Impl {
             const auto sample=std::ranges::find_if(data.files,[&](const MediaRecord& file) {
                 return std::ranges::find(selection,file.path)!=selection.end();
             });
-            const auto result=sample!=data.files.end()?renderName(value,data,*sample):L"Выберите файл в каталоге, чтобы увидеть пример";
+            std::wstring result=L"Выберите файлы в каталоге";
+            if(sample!=data.files.end()) {
+                auto snapshot=data;auto file=*sample;
+                if(!templateOnly) {
+                    const auto mode=SendMessageW(c(assignment),CB_GETCURSEL,0,0);
+                    Artwork workDraft;
+                    const auto oldWork=std::ranges::find(snapshot.artworks,file.artworkId,&Artwork::id);
+                    if(oldWork!=snapshot.artworks.end()) workDraft=*oldWork;
+                    const auto selectedWork=SendMessageW(c(work),CB_GETCURSEL,0,0);
+                    if(mode==2&&(selectedWork<0||selectedWork>=static_cast<LRESULT>(data.artworks.size()))) {
+                        SetWindowTextW(c(liveExample),L"Выберите существующую работу");return;
+                    }
+                    if(mode==2&&selectedWork>=0&&selectedWork<static_cast<LRESULT>(data.artworks.size())) workDraft=data.artworks[static_cast<std::size_t>(selectedWork)];
+                    const auto originalWorkId=workDraft.id;
+                    const bool preserveExisting=mode==3&&oldWork!=snapshot.artworks.end();
+                    const auto names=split(text(c(artist)),L';');
+                    std::vector<LibraryId> authors;
+                    for(std::size_t i=0;i<names.size();++i) {
+                        const auto found=std::ranges::find(snapshot.artists,names[i],&Artist::name);
+                        if(found!=snapshot.artists.end()) authors.push_back(found->id);
+                        else {
+                            Artist draft;draft.id=L"viewery-draft-artist-"+std::to_wstring(i);draft.name=names[i];draft.fileName=names[i];
+                            authors.push_back(draft.id);snapshot.artists.push_back(std::move(draft));
+                        }
+                    }
+                    workDraft.id=L"viewery-draft-work";
+                    if(!names.empty()||mode!=2) workDraft.artists=authors;
+                    const auto suppliedTitle=trim(text(c(title)));
+                    if(!preserveExisting&&(mode!=2||!suppliedTitle.empty())) workDraft.title=suppliedTitle.empty()?file.path.stem().wstring():suppliedTitle;
+                    auto number=integer(c(workNumber),0);
+                    if(!preserveExisting&&(mode!=2||number>0)) {
+                        if(!number) {
+                            number=1;
+                            for(const auto& existing:snapshot.artworks) {
+                                if(authors.empty()||std::ranges::find(existing.artists,authors.front())!=existing.artists.end()) number=std::max(number,existing.number+1);
+                            }
+                        }
+                        workDraft.number=number;
+                    }
+                    if(workDraft.number<=0) workDraft.number=1;
+                    snapshot.artworks.push_back(workDraft);file.artworkId=workDraft.id;
+                    MediaVersion version;version.id=L"viewery-draft-version";version.artworkId=workDraft.id;
+                    version.number=std::max<std::int64_t>(1,integer(c(versionNumber),1));
+                    if(mode==2) for(const auto& existing:snapshot.versions) {
+                        if(existing.artworkId==originalWorkId) version.number=std::max(version.number,existing.number+1);
+                    }
+                    if(mode==3) {
+                        const auto found=std::ranges::find(snapshot.versions,file.versionId,&MediaVersion::id);
+                        if(found!=snapshot.versions.end()) version.number=found->number;
+                    }
+                    snapshot.versions.push_back(version);file.versionId=version.id;
+                }
+                result=renderName(value,snapshot,file);
+            }
             SetWindowTextW(c(liveExample),result.c_str());
         } catch(const std::exception&) {SetWindowTextW(c(liveExample),L"Проверьте параметры выбранной части имени");}
     }
     void templateChanged() {
-        preview.clear();fillPreview();updateExample();
+        updateExample();
+        if(templateParent) templateParent->syncTemplateFromEditor();
     }
     void applyBlock() {
         const auto index=static_cast<int>(SendMessageW(c(blocks),LB_GETCURSEL,0,0));
@@ -619,7 +846,7 @@ struct RenameStudio::Impl {
         fillBlocks();
         templateChanged();
     }
-    void assignMetadata() {
+    void assignMetadata(bool addToQueue=false) {
         const auto selected=selectedRecords();
         if(selected.empty()) throw LibraryError("Select files in the catalog first");
         const auto names=split(text(c(artist)),L';');
@@ -631,7 +858,12 @@ struct RenameStudio::Impl {
         const LibraryId chosenId=chosen>=0&&chosen<static_cast<LRESULT>(data.artworks.size())
             ?data.artworks[static_cast<std::size_t>(chosen)].id:LibraryId{};
         const auto firstNumber=integer(c(workNumber),0),firstVersion=integer(c(versionNumber),1);
-        startJob([this,selected,names,extra,titleValue,alias,mode,chosenId,firstNumber,firstVersion]
+        auto value=naming;
+        value.authorSeparator=text(c(authorJoin));value.counterStart=integer(c(counterStart),1);
+        value.counterScope=static_cast<CounterScope>(std::max<LRESULT>(0,SendMessageW(c(counterScope),CB_GETCURSEL,0,0)));
+        std::vector<RenameProposal> existingQueue;
+        for(const auto& row:preview) existingQueue.push_back(row.proposal);
+        startJob([this,selected,names,extra,titleValue,alias,mode,chosenId,firstNumber,firstVersion,addToQueue,value,existingQueue]
                  (CollectionStore& db,std::stop_token stop) {
             auto current=db.snapshot();
             std::vector<LibraryId> artists;
@@ -693,11 +925,32 @@ struct RenameStudio::Impl {
                     file.versionId=db.saveVersion(v);
                 }
                 file.artworkId=workId;
-                for(const auto& [key,value]:extra) file.fields.insert_or_assign(key,value);
+                for(const auto& [key,fieldValue]:extra) file.fields.insert_or_assign(key,fieldValue);
                 db.saveFile(file);
             }
-            pending.message=L"Метаданные сохранены";
-        },L"Сохранение метаданных…");
+            if(stop.stop_requested()) {pending.message=L"Сохранение данных отменено";return;}
+            if(addToQueue) {
+                const auto snapshot=db.snapshot();
+                std::vector<MediaRecord> batch;
+                for(const auto& original:selected) {
+                    const auto saved=std::ranges::find(snapshot.files,original.id,&MediaRecord::id);
+                    if(saved==snapshot.files.end()) throw LibraryError("A selected file disappeared from the collection");
+                    batch.push_back(*saved);
+                }
+                const auto rendered=renderNames(value,snapshot,batch);
+                auto proposals=existingQueue;
+                for(std::size_t i=0;i<batch.size();++i) {
+                    const RenameProposal proposal{batch[i].id,batch[i].path,rendered[i],true};
+                    const auto found=std::ranges::find_if(proposals,[&](const RenameProposal& item) {
+                        return (!item.fileId.empty()&&item.fileId==proposal.fileId)||
+                            CompareStringOrdinal(item.source.c_str(),-1,proposal.source.c_str(),-1,TRUE)==CSTR_EQUAL;
+                    });
+                    if(found==proposals.end()) proposals.push_back(proposal);else *found=proposal;
+                }
+                pending.preview=previewRenames(proposals);pending.replaceQueue=true;pending.batchAdded=true;
+                pending.message=L"Пачка добавлена в очередь. Можно выбрать следующую.";
+            } else pending.message=L"Данные сохранены";
+        },addToQueue?L"Подготовка пачки…":L"Сохранение данных…");
     }
     void savePreset(bool duplicate) {
         auto value=naming;
@@ -717,20 +970,12 @@ struct RenameStudio::Impl {
         },L"Сохранение шаблона…");
     }
     void createPreview() {
-        const auto selected=selectedRecords();
-        if(selected.empty()) throw LibraryError("Select files in the catalog first");
-        auto value=naming;
-        value.authorSeparator=text(c(authorJoin));value.counterStart=integer(c(counterStart),1);
-        value.counterScope=static_cast<CounterScope>(std::max<LRESULT>(0,SendMessageW(c(counterScope),CB_GETCURSEL,0,0)));
-        const auto snapshot=data;
-        const auto generation=std::pair{selectionGeneration,directoryGeneration};
-        startJob([this,selected,value,snapshot,generation](CollectionStore&,std::stop_token) {
-            const auto names=renderNames(value,snapshot,selected);
-            std::vector<RenameProposal> proposals;
-            for(std::size_t i=0;i<selected.size();++i) proposals.push_back({selected[i].id,selected[i].path,names[i],true});
-            pending.preview=previewRenames(proposals);
-            pending.previewGeneration=generation;
-        },L"Проверка имён и конфликтов…");
+        assignMetadata(true);
+    }
+    void revalidateQueue() {
+        std::vector<RenameProposal> proposals;
+        for(const auto& row:preview) proposals.push_back(row.proposal);
+        preview=previewRenames(proposals);fillPreview();
     }
     void fillPreview() {
         filling=true;
@@ -752,6 +997,7 @@ struct RenameStudio::Impl {
             ListView_SetCheckState(c(previewList),index,row.proposal.enabled);
         }
         filling=false;
+        updateSummary();
     }
     void fillHistory() {
         filling=true;
@@ -782,19 +1028,24 @@ struct RenameStudio::Impl {
         },L"Чтение истории…");
     }
     void rename() {
-        const std::set<fs::path> selected(selection.begin(),selection.end());
         std::vector<RenameProposal> proposals;
+        std::vector<RenameProposal> excluded;
         for(const auto& row:preview) if(row.proposal.enabled) {
-            if(!selected.contains(row.proposal.source)) throw LibraryError("Selection changed. Rebuild the rename preview");
             proposals.push_back(row.proposal);
+        } else excluded.push_back(row.proposal);
+        if(proposals.empty()) throw LibraryError("Добавьте файлы в очередь переименования");
+        const auto verified=previewRenames(proposals);
+        if(std::ranges::any_of(verified,[](const RenamePreview& row){return !row.ready;})) {
+            preview=previewRenames([&]{std::vector<RenameProposal> all=proposals;all.insert(all.end(),excluded.begin(),excluded.end());return all;}());
+            fillPreview();throw LibraryError("В очереди есть конфликты. Исправьте имена или исключите строки.");
         }
-        if(proposals.empty()) throw LibraryError("Build a rename preview first");
-        const auto prompt=L"Переименовать "+std::to_wstring(proposals.size())+L" выбранных файлов?";
+        const auto prompt=L"Переименовать все "+std::to_wstring(proposals.size())+L" файлов из очереди одной операцией?";
         if(MessageBoxW(window,prompt.c_str(),L"Переименование",MB_YESNO|MB_ICONQUESTION)!=IDYES) return;
         before();
-        startJob([this,proposals](CollectionStore& db,std::stop_token stop) {
+        startJob([this,proposals,excluded](CollectionStore& db,std::stop_token stop) {
             pending.files=db.rename(proposals,stop);
             pending.message=pending.files->message;
+            if(pending.files->success) {pending.preview=previewRenames(excluded);pending.replaceQueue=true;}
         },L"Переименование…");
     }
     void reverse(bool recovery) {
@@ -814,13 +1065,20 @@ struct RenameStudio::Impl {
         if(filling) return;
         if(notification==CBN_CLOSEUP) {layout();return;}
         if(id>=tabAssign&&id<=tabHistory) {
+            if(id==tabTemplate&&!templateOnly) {openEditor();return;}
+            if(templateOnly) return;
             tab=id-tabAssign;scrollOffset=0;
-            if(tab==1) selectBlock();
             layout();return;
         }
         if(id==previewSearch&&notification==EN_CHANGE) {fillPreview();return;}
-        if(id==cancelTask&&notification==BN_CLICKED) {worker.request_stop();return;}
+        if(id==cancelTask&&notification==BN_CLICKED) {cancelJobs();return;}
+        if((id==dbBackup||id==metaExport||id==metaImport)&&notification==BN_CLICKED&&postponeUi(id)) return;
         if(busy()) return;
+        if((id==assignment&&notification==CBN_SELCHANGE)||(id==title&&notification==EN_CHANGE)||
+            (id==artist&&(notification==CBN_SELCHANGE||notification==CBN_EDITCHANGE))) {
+            if(id==assignment) layout();
+            updateExample();return;
+        }
         if((id==blockText||id==blockDigits||id==blockPrefix||id==blockSuffix||id==blockFallback)&&notification==EN_CHANGE) {
             applyBlock();return;
         }
@@ -845,6 +1103,13 @@ struct RenameStudio::Impl {
         if(id==blocks&&notification==LBN_SELCHANGE) {selectBlock();return;}
         if(notification!=BN_CLICKED) return;
         switch(id) {
+        case dataAdvanced:dataExpanded=!dataExpanded;layout();break;
+        case queueClear:preview.clear();fillPreview();SetWindowTextW(c(status),L"Очередь очищена. Файлы не изменены.");break;
+        case queueRemove: {
+            const int row=ListView_GetNextItem(c(previewList),-1,LVNI_SELECTED);
+            if(row>=0&&row<static_cast<int>(shown.size())) preview.erase(preview.begin()+static_cast<std::ptrdiff_t>(shown[static_cast<std::size_t>(row)]));
+            revalidateQueue();break;
+        }
         case advancedToggle:advanced=!advanced;layout();break;
         case presetMenu: {
             RECT bounds{};GetWindowRect(c(presetMenu),&bounds);
@@ -915,21 +1180,23 @@ struct RenameStudio::Impl {
             break;
         }
         case makePreview:
-            if(tab==1) {tab=2;scrollOffset=0;layout();}
-            createPreview();break;
+            if(templateOnly) {
+                if(templateParent) templateParent->syncTemplateFromEditor();
+                close();
+            } else createPreview();
+            break;
         case editName: {
             const int row=ListView_GetNextItem(c(previewList),-1,LVNI_SELECTED);
             if(row<0||row>=static_cast<int>(shown.size())) break;
             auto proposals=std::vector<RenameProposal>{};
             const auto changedRow=shown[static_cast<std::size_t>(row)];
-            const auto generation=std::pair{selectionGeneration,directoryGeneration};
             for(std::size_t i=0;i<preview.size();++i) {
                 auto proposal=preview[i].proposal;
                 if(i==changedRow) proposal.newName=text(c(newName));
                 proposals.push_back(std::move(proposal));
             }
-            startJob([this,proposals,generation](CollectionStore&,std::stop_token){
-                pending.preview=previewRenames(proposals);pending.previewGeneration=generation;},
+            startJob([this,proposals](CollectionStore&,std::stop_token){
+                pending.preview=previewRenames(proposals);pending.replaceQueue=true;},
                      L"Проверка имён…");break;
         }
         case apply:rename();break;
@@ -1035,6 +1302,14 @@ struct RenameStudio::Impl {
             case WM_SIZE:if(hwnd==window) layout();return 0;
             case WM_KEYDOWN:if(w==VK_ESCAPE) {close();return 0;}break;
             case finished:finishJob();return 0;
+            case validateQueueMessage:if(!busy()) revalidateQueue();return 0;
+            case deferredUiMessage:
+                deferredUiPosted=false;
+                if(deferredUiAction&&!busy()&&!indexPending&&directory==indexed) {
+                    const int action=std::exchange(deferredUiAction,0);
+                    command(action,BN_CLICKED);
+                }
+                return 0;
             case WM_COMMAND:command(LOWORD(w),HIWORD(w));return 0;
             case WM_ERASEBKGND: {
                 RECT client{};GetClientRect(hwnd,&client);fill(reinterpret_cast<HDC>(w),client,bg);return 1;
@@ -1134,8 +1409,11 @@ struct RenameStudio::Impl {
                     const auto& event=*reinterpret_cast<const NMLISTVIEW*>(l);
                     if(event.iItem>=0&&event.iItem<static_cast<int>(shown.size())) {
                         auto& row=preview[shown[static_cast<std::size_t>(event.iItem)]];
-                        row.proposal.enabled=ListView_GetCheckState(c(previewList),event.iItem)!=FALSE;
+                        const bool enabled=ListView_GetCheckState(c(previewList),event.iItem)!=FALSE;
+                        const bool changedState=row.proposal.enabled!=enabled;
+                        row.proposal.enabled=enabled;
                         if(event.uNewState&LVIS_SELECTED) SetWindowTextW(c(newName),row.proposal.newName.c_str());
+                        if(changedState&&!busy()) PostMessageW(window,validateQueueMessage,0,0);
                     }
                 } else if(header->idFrom==previewList&&header->code==LVN_COLUMNCLICK) {
                     const int column=reinterpret_cast<const NMLISTVIEW*>(l)->iSubItem;
@@ -1166,27 +1444,40 @@ RenameStudio::RenameStudio(HWND owner,UINT changedMessage,BeforeFilesChange befo
 RenameStudio::~RenameStudio()=default;
 HWND RenameStudio::window() const {return impl_->window;}
 void RenameStudio::show(RECT bounds,UINT dpi,HFONT font) {
-    impl_->dpi=dpi;impl_->font=font;
-    for(const auto& [id,control]:impl_->controls) {
-        (void)id;SendMessageW(control,WM_SETFONT,reinterpret_cast<WPARAM>(font),FALSE);
-    }
-    SendMessageW(impl_->c(blocks),LB_SETITEMHEIGHT,0,impl_->dp(32));
-    for(int id:{assignment,blockKind,blockCase,counterScope}) {
-        SendMessageW(impl_->c(id),CB_SETITEMHEIGHT,static_cast<WPARAM>(-1),impl_->dp(22));
-        SendMessageW(impl_->c(id),CB_SETITEMHEIGHT,0,impl_->dp(26));
-    }
+    const bool styleChanged=impl_->dpi!=dpi||impl_->font!=font;
+    const bool boundsChanged=!impl_->hasShownBounds||!EqualRect(&bounds,&impl_->shownBounds);
+    const bool visible=IsWindowVisible(impl_->window)!=FALSE;
+    if(!styleChanged&&!boundsChanged&&visible) return;
+    if(styleChanged) impl_->setFont(font,dpi);
+    impl_->shownBounds=bounds;impl_->hasShownBounds=true;
     SetWindowPos(impl_->window,HWND_TOP,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,
                  SWP_NOACTIVATE|SWP_SHOWWINDOW);
     impl_->layout();
 }
 void RenameStudio::hide() {ShowWindow(impl_->window,SW_HIDE);}
+void RenameStudio::openTemplates() {
+    SendMessageW(impl_->window,WM_COMMAND,MAKEWPARAM(tabTemplate,BN_CLICKED),reinterpret_cast<LPARAM>(impl_->c(tabTemplate)));
+}
+HWND RenameStudio::templatesWindow() const {return impl_->editorHost;}
+bool RenameStudio::processMessage(MSG& message) {
+    if(!impl_->editorHost||!impl_->editor||!IsWindowVisible(impl_->editorHost)||
+        (message.hwnd!=impl_->editorHost&&!IsChild(impl_->editorHost,message.hwnd))) return false;
+    if(message.message==WM_KEYDOWN&&message.wParam==VK_ESCAPE&&!impl_->editor->dropdownOpen()) {
+        ShowWindow(impl_->editorHost,SW_HIDE);return true;
+    }
+    return message.message==WM_KEYDOWN&&message.wParam==VK_TAB&&IsDialogMessageW(impl_->editor->window,&message);
+}
+void RenameStudio::collectionAction(CollectionAction action) {
+    const int id=action==CollectionAction::backup?dbBackup:action==CollectionAction::exportMetadata?metaExport:metaImport;
+    SendMessageW(impl_->window,WM_COMMAND,MAKEWPARAM(id,BN_CLICKED),reinterpret_cast<LPARAM>(impl_->c(id)));
+}
+std::size_t RenameStudio::queuedFileCount() const {return impl_->preview.size();}
 bool RenameStudio::busy() const {return impl_->busy();}
-void RenameStudio::cancel() {impl_->worker.request_stop();}
+void RenameStudio::cancel() {impl_->cancelJobs();}
 void RenameStudio::setFiles(std::vector<fs::path> directory,std::vector<fs::path> selected) {
     const bool changed=directory!=impl_->directory;
     if(changed) {
         ++impl_->directoryGeneration;
-        impl_->preview.clear();impl_->fillPreview();
     }
     impl_->directory=std::move(directory);
     if(selected!=impl_->selection) impl_->updateSelection(std::move(selected));

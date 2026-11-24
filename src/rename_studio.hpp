@@ -10,6 +10,7 @@ namespace viewery {
 
 class RenameStudio {
 public:
+    enum class CollectionAction { backup, exportMetadata, importMetadata };
     static constexpr UINT closeCommandId = 1051;
     using BeforeFilesChange = std::function<void()>;
     RenameStudio(HWND owner, UINT changedMessage, BeforeFilesChange beforeChange,
@@ -20,6 +21,11 @@ public:
     HWND window() const;
     void show(RECT bounds, UINT dpi, HFONT font);
     void hide();
+    void openTemplates();
+    HWND templatesWindow() const;
+    bool processMessage(MSG& message);
+    void collectionAction(CollectionAction action);
+    std::size_t queuedFileCount() const;
     bool busy() const;
     void cancel();
     void setFiles(std::vector<std::filesystem::path> directory, std::vector<std::filesystem::path> selected);

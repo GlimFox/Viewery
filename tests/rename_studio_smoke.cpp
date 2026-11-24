@@ -175,7 +175,7 @@ void checkScrollingLayout(RenameStudio& studio,HWND host,const fs::path& folder)
         for(const int width:{380,510}) {
         for(const int height:{340,460,700}) {
             sizePanel(studio,host,dpi,height,scaledFont,width);
-            for(const int tab:{1000,1001,1002,1003}) {
+            for(const int tab:{1000,1002,1003}) {
                 click(pane,tab);pump();
                 require(control(pane,closeStudio)!=nullptr,"Studio provides a close button on every tab");
                 const auto firstTab=bounds(control(pane,1000),pane);
@@ -317,181 +317,221 @@ void checkPresetDropdowns(RenameStudio& studio,HWND host,const fs::path& folder)
     }
 }
 
+std::wstring cell(HWND list,int row,int column) {
+    wchar_t value[1024]{};ListView_GetItemText(list,row,column,value,static_cast<int>(std::size(value)));return value;
+}
+std::vector<std::pair<std::wstring,std::wstring>> queueNames(HWND pane) {
+    const HWND list=control(pane,1037);std::vector<std::pair<std::wstring,std::wstring>> rows;
+    for(int row=0;row<ListView_GetItemCount(list);++row) rows.emplace_back(cell(list,row,0),cell(list,row,1));
+    return rows;
+}
+void chooseRow(HWND pane,int row) {
+    const HWND list=control(pane,1037);
+    ListView_SetItemState(list,-1,0,LVIS_SELECTED|LVIS_FOCUSED);
+    ListView_SetItemState(list,row,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);pump();
+}
+HWND templatePane(RenameStudio& studio) {
+    studio.openTemplates();pump();
+    return FindWindowExW(studio.templatesWindow(),nullptr,L"Viewery.RenameStudio.1",nullptr);
+}
+void checkOwnedEditor(RenameStudio& studio,const fs::path& folder) {
+    const HWND pane=templatePane(studio),host=studio.templatesWindow();
+    require(pane&&IsWindowVisible(host)&&GetWindow(host,GW_OWNER)!=nullptr,"Templates open in a separate owned modeless window");
+    require((GetWindowLongPtrW(host,GWL_STYLE)&WS_THICKFRAME)!=0,"The template editor is resizable");
+    for(const int width:{460,700}) for(const int height:{460,740}) {
+        SetWindowPos(host,nullptr,0,0,width,height,SWP_NOZORDER|SWP_NOACTIVATE);pump();
+        const HWND body=control(pane,1055);
+        SendMessageW(body,WM_VSCROLL,MAKEWPARAM(SB_TOP,0),0);
+        SetFocus(pane);HiddenCaret caret;
+        RedrawWindow(pane,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN|RDW_UPDATENOW);
+        CapturedFrame before,after;bool backing=capture(pane,before,true)&&containsPanelBackground(before);
+        if(!backing) require(capture(pane,before),"Template editor produces a native baseline");
+        const auto close=bounds(control(pane,closeStudio),pane);
+        for(int step=0;step<8;++step) {
+            SendMessageW(body,WM_VSCROLL,MAKEWPARAM(SB_BOTTOM,0),0);pump();
+            SendMessageW(body,WM_VSCROLL,MAKEWPARAM(SB_TOP,0),0);pump();
+        }
+        require(equalBounds(close,bounds(control(pane,closeStudio),pane))&&capture(pane,after,backing)&&before.bgra==after.bgra,
+            "Resized separate editor retains stable header and identical pixels after scrolling");
+    }
+    const HWND choice=control(pane,1015);
+    SendMessageW(choice,CB_SHOWDROPDOWN,TRUE,0);pump();
+    COMBOBOXINFO info{sizeof(info)};
+    require(GetComboBoxInfo(choice,&info)&&IsWindowVisible(info.hwndList),"Separate editor opens its native preset chooser");
+    require(screenshot(info.hwndList,folder/L"template-preset-popup.png"),"Preset chooser screenshot is saved");
+    const auto row=SendMessageW(choice,CB_FINDSTRINGEXACT,static_cast<WPARAM>(-1),reinterpret_cast<LPARAM>(L"Batch preset"));
+    SendMessageW(choice,CB_SETCURSEL,row,0);notify(pane,1015,CBN_SELCHANGE);
+    SendMessageW(choice,CB_SHOWDROPDOWN,FALSE,0);pump();
+    require(text(choice)==L"Batch preset","Saved templates can be selected in their separate editor");
+    checkBlockMouseInteraction(pane);
+    SendMessageW(control(pane,1055),WM_VSCROLL,MAKEWPARAM(SB_TOP,0),0);pump();
+    require(screenshot(pane,folder/L"rename-template.png"),"Separate template editor screenshot is saved");
+    SendMessageW(host,WM_CLOSE,0,0);pump();
+    require(!IsWindowVisible(host)&&IsWindowVisible(studio.window()),"Closing templates leaves the main rename panel open");
+}
+
 int wmain(int argc,wchar_t** argv) {
     if(argc!=2) return 2;
-    const fs::path outputRoot=fs::absolute(argv[1]);
-    const fs::path folder=outputRoot/(L"run-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
+    const fs::path folder=fs::absolute(argv[1])/(L"run-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
     const auto desktopName=L"VieweryStudioQA-"+std::to_wstring(GetCurrentProcessId());
     const HDESK previousDesktop=GetThreadDesktop(GetCurrentThreadId());
     HDESK desktop=CreateDesktopW(desktopName.c_str(),nullptr,nullptr,0,GENERIC_ALL,nullptr);
     if(!desktop||!SetThreadDesktop(desktop)) {
-        const DWORD error=GetLastError();
-        if(desktop)CloseDesktop(desktop);
-        std::cout<<"SKIP Private desktop unavailable (Win32 "<<error<<"). No UI or collection was opened.\n";
-        return 77;
+        const DWORD error=GetLastError();if(desktop)CloseDesktop(desktop);
+        std::cout<<"SKIP Private desktop unavailable (Win32 "<<error<<"). No UI or collection was opened.\n";return 77;
     }
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const HRESULT com=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     if(FAILED(com)) {SetThreadDesktop(previousDesktop);CloseDesktop(desktop);return 4;}
-    HWND host=nullptr;
-    HFONT font=nullptr;
+    HWND host=nullptr;HFONT font=nullptr;
     try {
-        fs::create_directories(folder);
+        fs::create_directories(folder/L"first");fs::create_directories(folder/L"second");
         const INITCOMMONCONTROLSEX init{sizeof(init),ICC_LISTVIEW_CLASSES|ICC_BAR_CLASSES};InitCommonControlsEx(&init);
-        WNDCLASSW wc{};wc.hInstance=GetModuleHandleW(nullptr);wc.lpfnWndProc=hostProcedure;
-        wc.lpszClassName=L"Viewery.StudioQAHost.1";RegisterClassW(&wc);
+        WNDCLASSW wc{};wc.hInstance=GetModuleHandleW(nullptr);wc.lpfnWndProc=hostProcedure;wc.lpszClassName=L"Viewery.StudioQAHost.1";RegisterClassW(&wc);
         host=CreateWindowExW(0,wc.lpszClassName,L"Viewery Rename Studio",WS_OVERLAPPEDWINDOW|WS_VISIBLE,
             0,0,650,850,nullptr,nullptr,wc.hInstance,nullptr);
         require(host!=nullptr,"Private desktop host window is created");
         font=CreateFontW(-14,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,0,L"Segoe UI");
-        const auto one=folder/L"image001.png",two=folder/L"image002.png",three=folder/L"keep.png";
-        {std::ofstream f(one,std::ios::binary);f<<"first bytes";}
-        {std::ofstream f(two,std::ios::binary);f<<"second bytes";}
-        {std::ofstream f(three,std::ios::binary);f<<"unselected bytes";}
+        const auto one=folder/L"first/imageA01.png",two=folder/L"first/imageA02.png",keep=folder/L"first/keep.png";
+        const auto three=folder/L"second/imageB01.png",four=folder/L"second/imageB02.png";
+        {std::ofstream f(one,std::ios::binary);f<<"first bytes";}{std::ofstream f(two,std::ios::binary);f<<"second bytes";}
+        {std::ofstream f(three,std::ios::binary);f<<"third bytes";}{std::ofstream f(four,std::ios::binary);f<<"fourth bytes";}
+        {std::ofstream f(keep,std::ios::binary);f<<"unselected bytes";}
         unsigned beforeChanges=0;
         auto studio=std::make_unique<RenameStudio>(host,changed,[&]{++beforeChanges;},folder/L"collection.sqlite3");
-        RECT client{};GetClientRect(host,&client);studio->show(client,96,font);
-        studio->setFiles({one,two,three},{one,two});
-        require(wait([&]{return !studio->busy()&&studio->snapshot().files.size()==3;}),"Studio indexes only its explicit isolated test database");
+        RECT area{};GetClientRect(host,&area);studio->show(area,96,font);
+        studio->setFiles({one,two,keep},{one,two});
+        require(studio->busy(),"Initial metadata indexing starts asynchronously");
+        studio->openTemplates();
+        require(!studio->templatesWindow(),"A template request during initial indexing is deferred");
+        require(wait([&]{return !studio->busy()&&studio->snapshot().files.size()==3&&
+            studio->templatesWindow()&&IsWindowVisible(studio->templatesWindow());}),
+            "The first template click opens automatically when indexing finishes without a second click");
+        unsigned editorWindows=0;
+        EnumThreadWindows(GetCurrentThreadId(),[](HWND window,LPARAM parameter)->BOOL {
+            wchar_t name[80]{};GetClassNameW(window,name,static_cast<int>(std::size(name)));
+            if(std::wstring_view(name)==L"Viewery.TemplateEditor.1") ++*reinterpret_cast<unsigned*>(parameter);
+            return TRUE;
+        },reinterpret_cast<LPARAM>(&editorWindows));
+        require(editorWindows==1,"A deferred request creates exactly one owned template window");
+        SendMessageW(studio->templatesWindow(),WM_CLOSE,0,0);pump();
+        studio->setFiles({three,four},{three,four});studio->openTemplates();studio->cancel();
+        require(wait([&]{return !studio->busy();})&&!IsWindowVisible(studio->templatesWindow()),
+            "Cancel clears a deferred template request instead of reopening the window later");
+        studio->setFiles({one,two,keep},{one,two});
+        require(wait([&]{return !studio->busy();}),"A new selection resumes normal indexing after cancellation");
+        RedrawWindow(studio->window(),nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN|RDW_UPDATENOW);
+        for(int iteration=0;iteration<20;++iteration) studio->show(area,96,font);
+        require(!GetUpdateRect(studio->window(),nullptr,FALSE)&&!GetUpdateRect(control(studio->window(),1055),nullptr,FALSE),
+            "Repeated unchanged show calls do not invalidate the panel during catalog zoom");
         const HWND pane=studio->window();
-        SetWindowTextW(control(pane,1006),L"Artist A");
-        SetWindowTextW(control(pane,1007),L"First Light");
-        SendMessageW(control(pane,1009),CB_SETCURSEL,1,0);
-        SetWindowTextW(control(pane,1013),L"tag=alpha\r\ntag=beta");
-        click(pane,1012);
-        require(!studio->busy()&&studio->snapshot().artists.empty()&&text(control(pane,1005)).find(L"more than once")!=std::wstring::npos,
-                "Duplicate custom field names are rejected before mutation");
+        require(!IsWindowVisible(control(pane,1013))&&!IsWindowVisible(control(pane,1014)),"Advanced metadata is hidden from the simple batch form");
+        SetWindowTextW(control(pane,1006),L"Artist A");SetWindowTextW(control(pane,1007),L"First Light");
+        SendMessageW(control(pane,1009),CB_SETCURSEL,1,0);notify(pane,1009,CBN_SELCHANGE);
+        SetWindowTextW(control(pane,1013),L"tag=alpha\r\ntag=beta");click(pane,1041);
+        require(!studio->busy()&&studio->snapshot().artists.empty()&&studio->queuedFileCount()==0,
+            "Duplicate custom fields are rejected before creating a batch");
         SetWindowTextW(control(pane,1013),L"tag=alpha\r\nsource=artist=portal");
-        click(pane,1012);
-        require(wait([&]{return !studio->busy()&&studio->snapshot().artworks.size()==1&&studio->snapshot().versions.size()==2;}),
-                "Metadata assignment groups selected files into versions of one work");
-        require(std::count_if(studio->snapshot().files.begin(),studio->snapshot().files.end(),[](const MediaRecord& file){
-            return !file.artworkId.empty()&&file.fields.contains(L"source")&&file.fields.at(L"source")==L"artist=portal";})==2,
-                "Multiline fields preserve values including equals signs and affect selected files only");
-        const auto originalWork=studio->snapshot().artworks.front().id;
-        const auto originalVersion=studio->snapshot().files.front().versionId;
-        SetWindowTextW(control(pane,1006),L"Artist B");SetWindowTextW(control(pane,1007),L"");
-        SendMessageW(control(pane,1009),CB_SETCURSEL,3,0);click(pane,1012);
-        require(wait([&]{return !studio->busy();})&&studio->snapshot().artworks.size()==1&&studio->snapshot().versions.size()==2&&
-                studio->snapshot().artworks.front().id==originalWork&&studio->snapshot().files.front().versionId==originalVersion,
-                "Artist-only assignment preserves work and version identities and numbering");
-        SetWindowTextW(control(pane,1006),L"Artist A");click(pane,1012);
-        require(wait([&]{return !studio->busy();}),"Artist-only assignment can restore the original artist");
-        click(pane,1001);
-        SetWindowTextW(control(pane,1034),L" + ");SetWindowTextW(control(pane,1035),L"8");
-        SendMessageW(control(pane,1036),CB_SETCURSEL,1,0);
-        SendMessageW(control(pane,1021),LB_SETCURSEL,0,0);
-        notify(pane,1021,LBN_SELCHANGE);
-        SetWindowTextW(control(pane,1029),L"A-");click(pane,1033);
-        require(text(control(pane,1034))==L" + "&&text(control(pane,1035))==L"8"&&
-                SendMessageW(control(pane,1036),CB_GETCURSEL,0,0)==1,"Editing a block preserves unsaved global template settings");
-        SetWindowTextW(control(pane,1015),L"Smoke preset");click(pane,1016);
-        require(wait([&]{return !studio->busy();}),"Visual template saves successfully");
-        {
-            CollectionStore verify(folder/L"collection.sqlite3");const auto presets=verify.presets();
-            require(presets.size()==1,"Saved template is persisted once");
-            const auto bytes=presets.front().json;
-            const int size=WideCharToMultiByte(CP_UTF8,0,bytes.data(),static_cast<int>(bytes.size()),nullptr,0,nullptr,nullptr);
-            std::string json(static_cast<std::size_t>(size),'\0');WideCharToMultiByte(CP_UTF8,0,bytes.data(),static_cast<int>(bytes.size()),json.data(),size,nullptr,nullptr);
-            const auto preset=parseTemplate(json);
-            require(preset.blocks.front().prefix==L"A-"&&preset.counterScope==CounterScope::artist&&preset.counterStart==8&&preset.authorSeparator==L" + ",
-                    "Persisted template retains block and global configuration");
-        }
-        click(pane,1001);
-        if(!IsWindowVisible(control(pane,1029))) click(pane,advancedOptions);
-        require(IsWindowVisible(control(pane,1029)),"Advanced block fields can be opened explicitly");
-        SetWindowTextW(control(pane,1029),L"B-");click(pane,1033);
-        SetWindowTextW(control(pane,1015),L"Other preset");click(pane,1017);
-        require(wait([&]{return !studio->busy();})&&SendMessageW(control(pane,1015),CB_GETCOUNT,0,0)==2,
-                "A second preset can be created and remains available in the chooser");
-        {
-            const HWND choice=control(pane,1015),body=control(pane,1055);
-            SendMessageW(body,WM_VSCROLL,MAKEWPARAM(SB_TOP,0),0);
-            SendMessageW(choice,CB_SHOWDROPDOWN,TRUE,0);pump();
-            const auto before=bounds(choice,pane);
-            SendMessageW(body,WM_MOUSEWHEEL,MAKEWPARAM(0,static_cast<WORD>(-WHEEL_DELTA)),0);pump();
-            require(SendMessageW(choice,CB_GETDROPPEDSTATE,0,0)&&equalBounds(before,bounds(choice,pane)),
-                    "An open preset dropdown stays in place when the form receives a wheel event");
-            const auto original=SendMessageW(choice,CB_FINDSTRINGEXACT,static_cast<WPARAM>(-1),reinterpret_cast<LPARAM>(L"Smoke preset"));
-            require(original!=CB_ERR,"Saved presets are individually selectable");
-            SendMessageW(choice,CB_SETCURSEL,original,0);notify(pane,1015,CBN_SELCHANGE);
-            SendMessageW(choice,CB_SHOWDROPDOWN,FALSE,0);pump();
-            SendMessageW(control(pane,1021),LB_SETCURSEL,0,0);notify(pane,1021,LBN_SELCHANGE);
-            require(text(control(pane,1029))==L"A-"&&text(control(pane,1015))==L"Smoke preset",
-                    "Choosing a saved preset restores its block settings without corrupting the selection");
-            require(text(control(pane,liveExample)).find(L"First Light")!=std::wstring::npos,
-                    "The constructor displays a live filename example from the selected artwork");
-        }
-        checkBlockMouseInteraction(pane);
-        checkPresetDropdowns(*studio,host,folder);
-        checkScrollingLayout(*studio,host,folder);
-        RECT originalClient{};GetClientRect(host,&originalClient);studio->show(originalClient,96,font);
-        click(pane,1001);
-        if(IsWindowVisible(control(pane,1029))) click(pane,advancedOptions);
-        SendMessageW(control(pane,1055),WM_VSCROLL,MAKEWPARAM(SB_TOP,0),0);pump();
-        require(screenshot(pane,folder/L"rename-template.png"),"Native visual template screenshot is saved");
-        click(pane,1002);click(pane,1041);
-        studio->setFiles({one,two,three},{three});
-        require(wait([&]{return !studio->busy();})&&ListView_GetItemCount(control(pane,1037))==0,
-                "Changing selection discards an old asynchronous rename preview");
-        studio->setFiles({one,two,three},{one,two});click(pane,1041);
-        require(wait([&]{return !studio->busy()&&ListView_GetItemCount(control(pane,1037))==2;}),
-                "New selection produces a two-file rename preview");
-        ListView_SetItemState(control(pane,1037),0,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);pump();
-        require(screenshot(pane,folder/L"rename-studio-preview.png"),"Native Rename Studio screenshot is saved from the isolated host");
+        require(text(control(pane,liveExample)).find(L"First Light")!=std::wstring::npos,"Simple data edits immediately update the draft filename example");
+        const auto draftFirst=text(control(pane,liveExample));
+        click(pane,1041);studio->setFiles({one,two,keep},{keep});
+        require(wait([&]{return !studio->busy()&&studio->queuedFileCount()==2;}),"Approved first batch survives an immediate selection change while preparing");
+        const auto firstNames=queueNames(pane);
+        require(firstNames.front().second==draftFirst,"The live draft example exactly matches the first approved filename");
+        require(firstNames.size()==2&&firstNames.front().second.find(L"Artist A_")==0&&fs::exists(one)&&fs::exists(two)&&beforeChanges==0,
+            "Approving a batch freezes names without renaming files");
+        studio->setFiles({three,four},{three,four});
+        require(wait([&]{return !studio->busy()&&studio->snapshot().files.size()==5;}),"A second directory can be prepared while the first batch remains queued");
+        SetWindowTextW(control(pane,1006),L"Artist B");SetWindowTextW(control(pane,1007),L"Second Work");
+        SetWindowTextW(control(pane,1013),L"");click(pane,1041);
+        require(wait([&]{return !studio->busy()&&studio->queuedFileCount()==4;}),"Different metadata produces a second batch in the same queue");
+        const auto frozen=queueNames(pane);
+        require(std::count_if(frozen.begin(),frozen.end(),[](const auto& item){return item.second.find(L"Artist A_")==0;})==2&&
+            std::count_if(frozen.begin(),frozen.end(),[](const auto& item){return item.second.find(L"Artist B_")==0;})==2,
+            "The queue preserves both batches with independent artist and title values");
+        HWND editorPane=templatePane(*studio);
+        require(editorPane!=nullptr&&IsWindowVisible(studio->templatesWindow()),"Templates are edited outside the batch panel");
+        SendMessageW(control(editorPane,1021),LB_SETCURSEL,0,0);notify(editorPane,1021,LBN_SELCHANGE);
+        SetWindowTextW(control(editorPane,1029),L"X-");click(editorPane,1033);
+        SetWindowTextW(control(editorPane,1015),L"Batch preset");click(editorPane,1016);
+        require(wait([&]{return !studio->busy();}),"A preset saves from the separate editor");
+        require(queueNames(pane)==frozen,"Editing and saving a template never changes already approved batch names");
+        checkOwnedEditor(*studio,folder);
+        require(queueNames(pane)==frozen,"Selecting and inspecting templates leaves every queued name frozen");
+        studio->setFiles({one,two,keep},{one});require(wait([&]{return !studio->busy();}),"A source can be approved again as a later batch");
+        SetWindowTextW(control(pane,1006),L"Artist A");SendMessageW(control(pane,1009),CB_SETCURSEL,3,0);click(pane,1041);
+        require(wait([&]{return !studio->busy()&&studio->queuedFileCount()==4;}),"A later batch replaces its existing source without duplication");
+        require(queueNames(pane).front().second.find(L"X-Artist A_")==0&&queueNames(pane)[1]==frozen[1],
+            "Re-approving one source updates only that source while the earlier batch stays frozen");
+        click(pane,1002);
+        chooseRow(pane,0);SetWindowTextW(control(pane,1039),L"collision.png");click(pane,1040);require(wait([&]{return !studio->busy();}),"The first queued name can be edited");
+        chooseRow(pane,1);SetWindowTextW(control(pane,1039),L"collision.png");click(pane,1040);require(wait([&]{return !studio->busy();}),"The second queued name can be edited");
+        require(cell(control(pane,1037),0,2)!=L"Готов"&&cell(control(pane,1037),1,2)!=L"Готов","Name conflicts are checked across separately approved batches");
+        click(pane,1042);
+        require(!studio->busy()&&beforeChanges==0&&fs::exists(one)&&fs::exists(two),"A conflicting queue cannot reach filesystem mutation");
+        for(int row=0;row<2;++row) {chooseRow(pane,row);SetWindowTextW(control(pane,1039),frozen[static_cast<std::size_t>(row)].second.c_str());click(pane,1040);require(wait([&]{return !studio->busy();}),"A conflict can be corrected in the queue");}
+        ListView_SetCheckState(control(pane,1037),0,FALSE);pump();
+        require(studio->queuedFileCount()==4&&!ListView_GetCheckState(control(pane,1037),0),"Excluding a row retains it in the queue for later");
+        ListView_SetCheckState(control(pane,1037),0,TRUE);pump();
+        studio->setFiles({one,two,keep},{one});require(wait([&]{return !studio->busy();}),"Returning to a previous directory retains both batches");
+        SetWindowTextW(control(pane,1006),L"Artist A");SetWindowTextW(control(pane,1007),L"");SendMessageW(control(pane,1009),CB_SETCURSEL,3,0);
+        editorPane=templatePane(*studio);SendMessageW(control(editorPane,1021),LB_SETCURSEL,0,0);notify(editorPane,1021,LBN_SELCHANGE);
+        SetWindowTextW(control(editorPane,1029),L"");click(editorPane,1033);click(editorPane,1041);pump();
+        click(pane,1041);
+        require(wait([&]{return !studio->busy()&&studio->queuedFileCount()==4;}),"Adding an already queued source replaces its row instead of duplicating it");
+        chooseRow(pane,3);click(pane,1059);
+        require(studio->queuedFileCount()==3,"An individual queued row can be removed");
+        studio->setFiles({three,four},{four});require(wait([&]{return !studio->busy();}),"The removed source can be selected again");
+        SetWindowTextW(control(pane,1006),L"Artist B");click(pane,1041);
+        require(wait([&]{return !studio->busy()&&studio->queuedFileCount()==4;}),"A removed row can be approved again without affecting the other batch");
+        studio->setFiles({three,four},{});pump();
+        const auto ready=queueNames(pane);click(pane,1002);
+        const auto requestsBeforeQueueClose=closeRequests;click(pane,closeStudio);
+        require(wait([&]{return closeRequests==requestsBeforeQueueClose+1;})&&studio->queuedFileCount()==4,
+            "Closing the rename panel preserves every approved batch");
+        studio->show(area,96,font);click(pane,1002);
+        require(queueNames(pane)==ready,"Reopening restores the exact approved queue names");
+        require(screenshot(pane,folder/L"rename-studio-preview.png"),"The multi-batch queue screenshot is saved");
         {
             auto confirm=confirmOwnDialog(GetCurrentThreadId());click(pane,1042);
         }
-        const auto renamedOne=folder/L"A-Artist A_001_v01_First Light.png";
-        const auto renamedTwo=folder/L"A-Artist A_001_v02_First Light.png";
-        require(wait([&]{return !studio->busy()&&fs::exists(renamedOne)&&fs::exists(renamedTwo);}),
-                "Confirmed rename changes the selected two files");
-        require(beforeChanges==1&&content(renamedOne)=="first bytes"&&content(renamedTwo)=="second bytes"&&content(three)=="unselected bytes",
-                "Rename preserves original content and unselected file");
-        studio->takeFileChanges();studio->setFiles({renamedOne,renamedTwo,three},{renamedOne,renamedTwo});
-        require(wait([&]{return !studio->busy();}),"Studio refreshes renamed file identities");
-        click(pane,1003);
-        require(ListView_GetItemCount(control(pane,1043))==1,"History lists the completed rename");
-        ListView_SetItemState(control(pane,1043),0,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);
-        require(wait([&]{return !studio->busy();})&&text(control(pane,1050)).find(L"image001.png")!=std::wstring::npos,"History exposes old and new paths");
-        {
-            auto confirm=confirmOwnDialog(GetCurrentThreadId());click(pane,1044);
+        require(wait([&]{return !studio->busy()&&studio->queuedFileCount()==0;}),"One confirmation applies all approved batches even when no files are currently selected");
+        std::vector<fs::path> renamed;
+        const std::vector<fs::path> originals{one,two,three,four};
+        const std::vector<std::string> contents{"first bytes","second bytes","third bytes","fourth bytes"};
+        for(const auto& original:originals) {
+            const auto name=std::ranges::find(ready,original.filename().wstring(),&std::pair<std::wstring,std::wstring>::first);
+            require(name!=ready.end(),"Every original source remains represented exactly once");
+            const auto target=original.parent_path()/name->second;renamed.push_back(target);
+            require(fs::exists(target)&&!fs::exists(original),"The approved target exists after the single rename operation");
         }
-        require(wait([&]{return !studio->busy()&&fs::exists(one)&&fs::exists(two);}),"Undo restores original filenames through the native history panel");
-        require(content(one)=="first bytes"&&content(two)=="second bytes"&&beforeChanges==2,
-                "Undo preserves both file contents");
-        const auto artistCount=studio->snapshot().artists.size();
-        const auto closeBefore=closeRequests;
-        click(pane,closeStudio);
-        require(wait([&]{return closeRequests==closeBefore+1;})&&!IsWindowVisible(pane),
-                "The close button hides Studio without disabling or destroying the module");
-        studio->show(originalClient,96,font);click(pane,1000);pump();
-        require(IsWindowVisible(pane)&&studio->snapshot().artists.size()==artistCount&&studio->snapshot().files.size()==3,
-                "Reopening the closed panel preserves its collection and selection");
-        COMBOBOXINFO comboInfo{sizeof(comboInfo)};
-        require(GetComboBoxInfo(control(pane,1006),&comboInfo)&&comboInfo.hwndItem,
-                "Editable artist chooser exposes its native text input");
-        SetFocus(comboInfo.hwndItem);
-        SendMessageW(comboInfo.hwndItem,WM_KEYDOWN,VK_ESCAPE,0);
-        require(wait([&]{return closeRequests==closeBefore+2;})&&!IsWindowVisible(pane),
-                "Escape from a nested editable field closes Studio without disabling the module");
-        studio->show(originalClient,96,font);
-        std::cout<<"Studio GUI checks passed.\n";
-        const auto artifactPath=folder.u8string();
-        std::cout<<"Artifacts: ";
-        std::cout.write(reinterpret_cast<const char*>(artifactPath.data()),static_cast<std::streamsize>(artifactPath.size()));
-        std::cout<<'\n';
-        studio.reset();
-        DeleteObject(font);font=nullptr;
-        DestroyWindow(host);host=nullptr;
+        for(std::size_t i=0;i<renamed.size();++i) require(content(renamed[i])==contents[i],"Batch renaming preserves file contents");
+        require(beforeChanges==1&&content(keep)=="unselected bytes","One operation changes only the four approved sources");
+        studio->takeFileChanges();studio->setFiles({renamed[0],renamed[1],keep},{});require(wait([&]{return !studio->busy();}),"The collection refreshes renamed identities");
+        click(pane,1003);require(ListView_GetItemCount(control(pane,1043))==1,"All batches produce one durable history operation");
+        ListView_SetItemState(control(pane,1043),0,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);pump();
+        require(wait([&]{return !studio->busy();})&&text(control(pane,1050)).find(L"imageA01.png")!=std::wstring::npos,"History exposes the paths of the entire combined operation");
+        {auto confirm=confirmOwnDialog(GetCurrentThreadId());click(pane,1044);}
+        require(wait([&]{return !studio->busy()&&std::ranges::all_of(originals,[](const fs::path& path){return fs::exists(path);});}),"Undo restores both batches from the single journal operation");
+        for(std::size_t i=0;i<originals.size();++i) require(content(originals[i])==contents[i],"Undo preserves every original byte sequence");
+        require(beforeChanges==2,"Undo invokes one file-change operation for all batches");
+        studio->setFiles({one,two,keep},{one,two});require(wait([&]{return !studio->busy();}),"Panel remains usable after multi-directory Undo");
+        checkScrollingLayout(*studio,host,folder);
+        RECT originalClient{};GetClientRect(host,&originalClient);studio->show(originalClient,96,font);click(pane,1000);
+        require(screenshot(pane,folder/L"rename-batch-data.png"),"The simplified batch data form screenshot is saved");
+        const auto closeBefore=closeRequests;click(pane,closeStudio);
+        require(wait([&]{return closeRequests==closeBefore+1;})&&!IsWindowVisible(pane),"Closing the panel keeps its collection intact");
+        studio->show(originalClient,96,font);require(studio->snapshot().files.size()==5,"Reopening the batch panel restores the same collection");
+        const auto artistControl=control(pane,1006);COMBOBOXINFO comboInfo{sizeof(comboInfo)};
+        require(GetComboBoxInfo(artistControl,&comboInfo)&&comboInfo.hwndItem,"Artist input has an editable native field");
+        SetFocus(comboInfo.hwndItem);SendMessageW(comboInfo.hwndItem,WM_KEYDOWN,VK_ESCAPE,0);
+        require(wait([&]{return closeRequests==closeBefore+2;})&&!IsWindowVisible(pane),"Escape closes the batch panel from a nested input");
+        std::cout<<"Studio batch and template checks passed.\n";
+        studio.reset();DeleteObject(font);font=nullptr;DestroyWindow(host);host=nullptr;
     } catch(const std::exception& error) {
-        std::cerr<<error.what()<<std::endl;
-        if(host)DestroyWindow(host);if(font)DeleteObject(font);CoUninitialize();SetThreadDesktop(previousDesktop);CloseDesktop(desktop);return 1;
+        std::cerr<<error.what()<<std::endl;if(host)DestroyWindow(host);if(font)DeleteObject(font);
+        CoUninitialize();SetThreadDesktop(previousDesktop);CloseDesktop(desktop);return 1;
     }
     CoUninitialize();SetThreadDesktop(previousDesktop);CloseDesktop(desktop);return 0;
 }
-
-
-
-

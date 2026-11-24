@@ -30,7 +30,7 @@ struct CollectionViewOptions {
 
 struct CollectionEntry {
     bool group = false;
-    std::wstring key, label;
+    std::wstring key, label, artistName;
     std::vector<std::wstring> ancestorKeys;
     LibraryId mediaId;
     std::filesystem::path path;
