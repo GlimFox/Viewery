@@ -29,6 +29,9 @@ public:
     bool busy() const;
     void cancel();
     void setFiles(std::vector<std::filesystem::path> directory, std::vector<std::filesystem::path> selected);
+    // Reload registry changes without reindexing files or rebuilding approved batches.
+    // Calls made during a job are coalesced and run when that job finishes.
+    void refreshCollection();
     const CollectionSnapshot& snapshot() const;
     std::optional<RenameResult> takeFileChanges();
 private:

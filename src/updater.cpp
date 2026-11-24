@@ -20,7 +20,7 @@
 #include <vector>
 
 #ifndef VIEWERY_VERSION
-#define VIEWERY_VERSION "0.2.0-beta.3"
+#define VIEWERY_VERSION "0.2.0-beta.4"
 #endif
 
 namespace viewery {

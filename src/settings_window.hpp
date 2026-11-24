@@ -11,7 +11,7 @@ namespace viewery {
 enum class SettingsAction {
     quickHotkey, groupChord, automaticUpdates, renameModule,
     checkUpdates, installUpdate, releaseNotes, mediaTools,
-    templates, backupCollection, exportMetadata, importMetadata, repository
+    templates, backupCollection, exportMetadata, importMetadata, repository, artists
 };
 
 struct SettingsEvent {

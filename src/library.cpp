@@ -15,6 +15,7 @@
 #include <iomanip>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -288,6 +289,20 @@ Metadata readFields(std::wstring_view fields)
     return decodeFields(Json::parse(utf8(fields)));
 }
 
+Json artistJson(const Artist& artist)
+{
+    return {{"id",utf8(artist.id)},{"name",utf8(artist.name)},{"fileName",utf8(artist.fileName)},
+        {"aliases",utf8(artist.aliases)},{"order",artist.order},{"fields",fieldsJson(artist.fields)}};
+}
+
+Artist artistFromJson(std::wstring_view value)
+{
+    const auto item=Json::parse(utf8(value));
+    return {wide(item.at("id").get<std::string>()),wide(item.at("name").get<std::string>()),
+        wide(item.at("fileName").get<std::string>()),wide(item.at("aliases").get<std::string>()),
+        item.at("order").get<std::int64_t>(),decodeFields(item.at("fields"))};
+}
+
 struct SqliteApi {
     HMODULE module = nullptr;
     decltype(&sqlite3_open16) open = nullptr;
@@ -408,6 +423,33 @@ struct Transaction {
     void commit() { execute(database, ("RELEASE " + name).c_str()); committed = true; }
 };
 
+struct OperationLock {
+    HANDLE handle;
+    explicit OperationLock(HANDLE mutex) : handle(mutex) {
+        const DWORD result=WaitForSingleObject(handle,0);
+        if(result!=WAIT_OBJECT_0&&result!=WAIT_ABANDONED) throw LibraryError("Another collection operation is in progress.");
+    }
+    ~OperationLock() {ReleaseMutex(handle);}
+};
+
+void backupDatabase(sqlite3* source,const fs::path& output)
+{
+    Handle reservation(CreateFileW(output.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr));
+    if(!reservation) throw LibraryError(utf8(systemError(L"Не удалось создать резервную копию базы")));
+    reservation=Handle{};
+    sqlite3* destination=nullptr;
+    bool success=false;
+    if(api().open(output.c_str(),&destination)==SQLITE_OK) {
+        if(auto* backup=api().backupInit(destination,"main",source,"main")) {
+            const int result=api().backupStep(backup,-1);
+            const int completed=api().backupFinish(backup);
+            success=result==SQLITE_DONE&&completed==SQLITE_OK;
+        }
+    }
+    if(destination) api().close(destination);
+    if(!success) {DeleteFileW(output.c_str());throw LibraryError("The collection backup could not be completed.");}
+}
+
 } // namespace
 
 fs::path defaultDatabasePath()
@@ -494,9 +536,14 @@ struct CollectionStore::Impl {
     void operationStatus(const LibraryId& operation, std::wstring_view status, std::wstring_view message = {});
     void stepStage(const LibraryId& operation, std::size_t index, std::wstring_view stage);
     void updateMediaPaths(const std::vector<RenameStep>& steps, bool original);
+    struct ArtistChange { Artist before,after; };
+    Artist artist(const LibraryId& id) const;
+    void writeArtist(const Artist& artist);
+    void validateArtist(const Artist& artist) const;
+    std::optional<ArtistChange> artistChange(const LibraryId& operation) const;
     bool rollback(const LibraryId& operation, std::vector<RenameStep>& steps, std::wstring& problem);
     RenameResult perform(const std::vector<RenameProposal>& proposals, std::stop_token cancellation,
-                         const LibraryId& parent = {});
+                         const LibraryId& parent = {}, const ArtistChange* artistChange = nullptr);
     std::vector<RenameStep> operationSteps(const LibraryId& operation);
 };
 
@@ -516,7 +563,7 @@ CollectionStore::Impl::Impl(fs::path location) : path(absolutePath(location))
         Statement version(database, L"PRAGMA user_version");
         version.row();
         const auto schema = version.integer(0);
-        if (schema > 1) throw LibraryError("The collection requires a newer Viewery version.");
+        if (schema > 2) throw LibraryError("The collection requires a newer Viewery version.");
         if (schema == 0) {
             Statement count(database, L"SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'");
             count.row();
@@ -535,6 +582,12 @@ CollectionStore::Impl::Impl(fs::path location) : path(absolutePath(location))
                 "CREATE TABLE rename_steps(operation_id TEXT NOT NULL REFERENCES operations(id),position INTEGER NOT NULL,file_id TEXT NOT NULL REFERENCES media(id),source TEXT NOT NULL,temporary TEXT NOT NULL,target TEXT NOT NULL,identity TEXT NOT NULL,hash TEXT NOT NULL,bytes INTEGER NOT NULL,stage TEXT NOT NULL,previous TEXT NOT NULL,PRIMARY KEY(operation_id,position));"
                 "PRAGMA user_version=1; PRAGMA application_id=1448563289;");
             transaction.commit();
+        }
+        if(schema<2) {
+            if(schema==1) backupDatabase(database,path.parent_path()/(L"collection-before-schema-2-"+guid()+L".sqlite3"));
+            Transaction migration(database);
+            execute(database,"CREATE TABLE IF NOT EXISTS operation_artist_changes(operation_id TEXT PRIMARY KEY REFERENCES operations(id),artist_id TEXT NOT NULL,before_json TEXT NOT NULL,after_json TEXT NOT NULL); PRAGMA user_version=2;");
+            migration.commit();
         }
         Statement check(database, L"PRAGMA quick_check");
         if (!check.row() || check.text(0) != L"ok") throw LibraryError("The collection database failed its integrity check.");
@@ -601,13 +654,27 @@ CollectionSnapshot CollectionStore::snapshot() const
     return result;
 }
 
-LibraryId CollectionStore::saveArtist(Artist artist)
+Artist CollectionStore::Impl::artist(const LibraryId& id) const
 {
-    std::lock_guard lock(impl_->mutex);
-    if (artist.name.empty()) throw LibraryError("Enter the artist's name.");
-    if (artist.id.empty()) artist.id = guid();
-    if (artist.fileName.empty()) artist.fileName = artist.name;
-    Statement query(impl_->database, L"INSERT INTO artists VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,file_name=excluded.file_name,aliases=excluded.aliases,sort_order=excluded.sort_order,fields=excluded.fields");
+    Statement query(database,L"SELECT id,name,file_name,aliases,sort_order,fields FROM artists WHERE id=?");
+    query.text(1,id);
+    if(!query.row()) throw LibraryError("The artist no longer exists. Refresh the registry.");
+    return {query.text(0),query.text(1),query.text(2),query.text(3),query.integer(4),readFields(query.text(5))};
+}
+
+void CollectionStore::Impl::validateArtist(const Artist& updated) const
+{
+    if(updated.id.empty()||updated.name.find_first_not_of(L" \r\n\t")==std::wstring::npos)
+        throw LibraryError("Enter the artist's name.");
+    Statement existing(database,L"SELECT id,name FROM artists");
+    while(existing.row()) if(existing.text(0)!=updated.id&&
+        CompareStringOrdinal(existing.text(1).c_str(),-1,updated.name.c_str(),-1,TRUE)==CSTR_EQUAL)
+        throw LibraryError("An artist with this name already exists.");
+}
+
+void CollectionStore::Impl::writeArtist(const Artist& artist)
+{
+    Statement query(database, L"INSERT INTO artists VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,file_name=excluded.file_name,aliases=excluded.aliases,sort_order=excluded.sort_order,fields=excluded.fields");
     query.text(1, artist.id);
     query.text(2, artist.name);
     query.text(3, artist.fileName);
@@ -615,7 +682,127 @@ LibraryId CollectionStore::saveArtist(Artist artist)
     query.integer(5, artist.order);
     query.text(6, wide(fieldsJson(artist.fields).dump()));
     query.done();
+}
+
+std::optional<CollectionStore::Impl::ArtistChange> CollectionStore::Impl::artistChange(const LibraryId& operation) const
+{
+    Statement query(database,L"SELECT before_json,after_json FROM operation_artist_changes WHERE operation_id=?");
+    query.text(1,operation);
+    if(!query.row()) return {};
+    return ArtistChange{artistFromJson(query.text(0)),artistFromJson(query.text(1))};
+}
+
+LibraryId CollectionStore::saveArtist(Artist artist)
+{
+    std::lock_guard lock(impl_->mutex);
+    OperationLock operation(impl_->operationMutex.value);
+    if (artist.id.empty()) artist.id = guid();
+    if (artist.fileName.empty()) artist.fileName = artist.name;
+    Transaction transaction(impl_->database);
+    Statement pending(impl_->database,L"SELECT count(*) FROM operations WHERE status IN('planned','running','recovery_required')");
+    pending.row();
+    if(pending.integer(0)) throw LibraryError("Recover unfinished file operations before editing the artist registry.");
+    impl_->validateArtist(artist);
+    impl_->writeArtist(artist);
+    transaction.commit();
     return artist.id;
+}
+
+void CollectionStore::deleteArtist(const LibraryId& id)
+{
+    std::lock_guard lock(impl_->mutex);
+    OperationLock operation(impl_->operationMutex.value);
+    impl_->artist(id);
+    Statement pending(impl_->database,L"SELECT count(*) FROM operations WHERE status IN('planned','running','recovery_required')");
+    pending.row();if(pending.integer(0)) throw LibraryError("Recover unfinished file operations before removing an artist.");
+    Transaction transaction(impl_->database);
+    Statement links(impl_->database,L"DELETE FROM artwork_artists WHERE artist_id=?");
+    links.text(1,id);links.done();
+    Statement artist(impl_->database,L"DELETE FROM artists WHERE id=?");artist.text(1,id);artist.done();
+    transaction.commit();
+}
+
+namespace {
+bool artistBoundary(wchar_t value) {return std::wstring_view(L" _-&+[]()").find(value)!=std::wstring_view::npos;}
+
+std::vector<std::wstring> artistTokens(const Artist& artist)
+{
+    std::vector<std::wstring> result;
+    const auto add=[&](std::wstring token) {
+        const auto begin=token.find_first_not_of(L" \r\n\t");
+        if(begin==std::wstring::npos) return;
+        token=token.substr(begin,token.find_last_not_of(L" \r\n\t")-begin+1);
+        result.push_back(token);
+        const auto safe=sanitizeWindowsName(token);if(safe!=token) result.push_back(safe);
+    };
+    add(artist.fileName);add(artist.name);
+    std::size_t start=0;
+    while(start<artist.aliases.size()) {
+        const auto end=artist.aliases.find_first_of(L",;\r\n",start);
+        add(artist.aliases.substr(start,end==std::wstring::npos?end:end-start));
+        if(end==std::wstring::npos) break;start=end+1;
+    }
+    std::ranges::sort(result,[](const auto& a,const auto& b){return a.size()>b.size();});
+    return result;
+}
+
+std::wstring renamedArtistFile(const fs::path& file,const Artist& previous,const Artist& updated)
+{
+    auto stem=file.stem().wstring();
+    const auto replacement=sanitizeWindowsName(updated.fileName.empty()?updated.name:updated.fileName);
+    for(const auto& token:artistTokens(previous)) {
+        if(token.size()>stem.size()) continue;
+        for(std::size_t at=0;at+token.size()<=stem.size();++at) {
+            if(at&&!artistBoundary(stem[at-1])) continue;
+            const auto end=at+token.size();if(end<stem.size()&&!artistBoundary(stem[end])) continue;
+            if(CompareStringOrdinal(stem.data()+at,static_cast<int>(token.size()),token.data(),static_cast<int>(token.size()),TRUE)==CSTR_EQUAL) {
+                stem.replace(at,token.size(),replacement);return stem+file.extension().wstring();
+            }
+        }
+    }
+    return file.filename().wstring();
+}
+}
+
+std::vector<RenamePreview> CollectionStore::previewArtistRename(const Artist& input) const
+{
+    std::lock_guard lock(impl_->mutex);
+    Artist updated=input;if(updated.fileName.empty()) updated.fileName=updated.name;
+    const auto previous=impl_->artist(updated.id);impl_->validateArtist(updated);
+    Statement files(impl_->database,L"SELECT m.id,m.path FROM media m JOIN artwork_artists a ON a.artwork_id=m.artwork_id WHERE a.artist_id=? ORDER BY m.path_key");
+    files.text(1,updated.id);
+    std::vector<RenameProposal> proposals;
+    while(files.row()) {
+        const fs::path path=files.text(1);
+        proposals.push_back({files.text(0),path,renamedArtistFile(path,previous,updated),true});
+    }
+    return previewRenames(proposals);
+}
+
+RenameResult CollectionStore::renameArtist(const Artist& expectedBefore,Artist updated,const std::vector<RenameProposal>& proposals,std::stop_token cancellation)
+{
+    std::lock_guard lock(impl_->mutex);
+    OperationLock operation(impl_->operationMutex.value);
+    try {
+        if(updated.fileName.empty()) updated.fileName=updated.name;
+        impl_->validateArtist(updated);
+        const auto previous=impl_->artist(updated.id);
+        if(artistJson(previous)!=artistJson(expectedBefore))
+            throw LibraryError("Artist metadata changed after preview. Refresh the registry.");
+        std::map<LibraryId,std::wstring> expected;
+        Statement files(impl_->database,L"SELECT m.id,m.path FROM media m JOIN artwork_artists a ON a.artwork_id=m.artwork_id WHERE a.artist_id=?");
+        files.text(1,updated.id);while(files.row()) expected.emplace(files.text(0),pathKey(files.text(1)));
+        if(expected.size()!=proposals.size()) throw LibraryError("Artist files changed. Rebuild the rename preview.");
+        for(const auto& proposal:proposals) {
+            const auto file=expected.find(proposal.fileId);
+            if(!proposal.enabled||file==expected.end()||file->second!=pathKey(proposal.source)||
+               proposal.newName!=renamedArtistFile(proposal.source,previous,updated))
+                throw LibraryError("The artist rename preview does not match all linked files.");
+            expected.erase(file);
+        }
+        const Impl::ArtistChange change{previous,updated};
+        return impl_->perform(proposals,cancellation,{},&change);
+    } catch(const std::exception& error) {return {false,cancellation.stop_requested(),{},wide(error.what()),{}};}
 }
 
 LibraryId CollectionStore::saveArtwork(Artwork artwork)
@@ -853,17 +1040,6 @@ void CollectionStore::setSetting(std::wstring_view key, std::wstring_view value)
 
 namespace {
 
-struct OperationLock {
-    HANDLE handle;
-    explicit OperationLock(HANDLE mutex) : handle(mutex) {
-        const DWORD result = WaitForSingleObject(handle, 0);
-        if (result != WAIT_OBJECT_0 && result != WAIT_ABANDONED) {
-            throw LibraryError("Another collection operation is in progress.");
-        }
-    }
-    ~OperationLock() { ReleaseMutex(handle); }
-};
-
 class RenameCancelled : public std::exception {
 public:
     const char* what() const noexcept override { return "Renaming was canceled."; }
@@ -943,8 +1119,14 @@ bool CollectionStore::Impl::rollback(const LibraryId& operation, std::vector<Ren
             step.current = step.source;
             stepStage(operation, index, L"restored");
         }
-        updateMediaPaths(steps, true);
+        Transaction restored(database);
+        updateMediaPaths(steps,true);
+        if(const auto change=artistChange(operation)) {
+            const auto current=artist(change->before.id);
+            if(artistJson(current)==artistJson(change->after)) writeArtist(change->before);
+        }
         operationStatus(operation, L"rolled_back", L"Исходные имена восстановлены");
+        restored.commit();
         return true;
     } catch (const std::exception& error) {
         problem = wide(error.what());
@@ -954,7 +1136,7 @@ bool CollectionStore::Impl::rollback(const LibraryId& operation, std::vector<Ren
 }
 
 RenameResult CollectionStore::Impl::perform(const std::vector<RenameProposal>& proposals, std::stop_token cancellation,
-                                           const LibraryId& parent)
+                                           const LibraryId& parent,const ArtistChange* change)
 {
     RenameResult result;
     if (cancellation.stop_requested()) return {false, true, {}, L"Переименование отменено", {}};
@@ -969,6 +1151,8 @@ RenameResult CollectionStore::Impl::perform(const std::vector<RenameProposal>& p
     std::set<std::wstring> identities;
     bool journalCommitted = false;
     try {
+        if(change&&artistJson(artist(change->before.id))!=artistJson(change->before))
+            throw LibraryError("Artist metadata changed after preview. Refresh the registry.");
         for (const auto& row : preview) {
             if (!row.ready || row.proposal.source == row.target) continue;
             if (cancellation.stop_requested()) throw RenameCancelled();
@@ -999,7 +1183,7 @@ RenameResult CollectionStore::Impl::perform(const std::vector<RenameProposal>& p
             steps.push_back({file, row.proposal.source, temporary, row.target, row.proposal.source, {},
                              std::move(state), L"planned", std::move(handle)});
         }
-        if (steps.empty()) return {true, false, {}, L"Имена файлов уже соответствуют предпросмотру", {}};
+        if(steps.empty()&&!change) return {true,false,{},L"Имена файлов уже соответствуют предпросмотру",{}};
         result.operationId = guid();
         {
             Transaction transaction(database);
@@ -1009,6 +1193,12 @@ RenameResult CollectionStore::Impl::perform(const std::vector<RenameProposal>& p
             operation.integer(3, static_cast<std::int64_t>(steps.size()));
             operation.optional(4, parent);
             operation.done();
+            if(change) {
+                Statement edit(database,L"INSERT INTO operation_artist_changes VALUES(?,?,?,?)");
+                edit.text(1,result.operationId);edit.text(2,change->before.id);
+                edit.text(3,wide(artistJson(change->before).dump()));edit.text(4,wide(artistJson(change->after).dump()));
+                edit.done();
+            }
             for (std::size_t index = 0; index < steps.size(); ++index) {
                 const auto& step = steps[index];
                 Statement query(database, L"INSERT INTO rename_steps VALUES(?,?,?,?,?,?,?,?,?,'planned','')");
@@ -1046,6 +1236,11 @@ RenameResult CollectionStore::Impl::perform(const std::vector<RenameProposal>& p
         {
             Transaction transaction(database);
             updateMediaPaths(steps, false);
+            if(change) {
+                if(artistJson(artist(change->before.id))!=artistJson(change->before))
+                    throw LibraryError("Artist metadata changed during renaming. The file operation was canceled.");
+                writeArtist(change->after);
+            }
             operationStatus(result.operationId, L"complete", L"Переименование завершено");
             if (!parent.empty()) operationStatus(parent, L"undone", L"Операция отменена");
             transaction.commit();
@@ -1111,7 +1306,14 @@ RenameResult CollectionStore::undo(const LibraryId& operation, std::stop_token c
             }
             proposals.push_back({step.fileId, step.target, step.source.filename().wstring(), true});
         }
-        return impl_->perform(proposals, cancellation, operation);
+        auto change=impl_->artistChange(operation);
+        if(change) {
+            if(artistJson(impl_->artist(change->after.id))!=artistJson(change->after))
+                throw LibraryError("The artist was edited after renaming. Undo will not overwrite those changes.");
+            std::swap(change->before,change->after);
+            impl_->validateArtist(change->after);
+        }
+        return impl_->perform(proposals,cancellation,operation,change?&*change:nullptr);
     } catch (const std::exception& error) { return {false, cancellation.stop_requested(), operation, wide(error.what()), {}}; }
 }
 
@@ -1128,7 +1330,7 @@ RenameResult CollectionStore::recover(const LibraryId& operation, std::stop_toke
             return result;
         }
         auto steps = impl_->operationSteps(operation);
-        if (steps.empty()) throw LibraryError("The operation journal contains no file steps.");
+        if (steps.empty()&&!impl_->artistChange(operation)) throw LibraryError("The operation journal contains no file steps.");
         std::set<std::wstring> opened;
         for (auto& step : steps) {
             if (cancellation.stop_requested()) return {false, true, operation, L"Восстановление отменено", {}};
@@ -1184,23 +1386,7 @@ void CollectionStore::backup(const fs::path& output) const
     std::lock_guard lock(impl_->mutex);
     const auto target = absolutePath(output);
     if (pathKey(target) == pathKey(impl_->path)) throw LibraryError("Choose a separate database backup file.");
-    Handle reservation(CreateFileW(target.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
-    if (!reservation) throw LibraryError(utf8(systemError(L"Не удалось создать резервную копию базы")));
-    reservation = Handle{};
-    sqlite3* destination = nullptr;
-    bool success = false;
-    if (api().open(target.c_str(), &destination) == SQLITE_OK) {
-        if (auto* backup = api().backupInit(destination, "main", impl_->database, "main")) {
-            const int result = api().backupStep(backup, -1);
-            const int completed = api().backupFinish(backup);
-            success = result == SQLITE_DONE && completed == SQLITE_OK;
-        }
-    }
-    if (destination) api().close(destination);
-    if (!success) {
-        DeleteFileW(target.c_str());
-        throw LibraryError("The collection backup could not be completed.");
-    }
+    backupDatabase(impl_->database,target);
 }
 
 namespace {

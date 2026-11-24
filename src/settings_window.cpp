@@ -23,7 +23,7 @@ enum Control : int {
     quickChoice,groupChoice,automaticCheck,checkButton,installButton,notesButton,
     mediaButton,statusText,versionText,repositoryButton,
     collectionLabel,backupLabel,quickLabel,groupLabel,keyboardHint,updatesLabel,
-    aboutTitle,aboutText,licenseText,viewportId,contentId
+    aboutTitle,aboutText,licenseText,viewportId,contentId,artistsButton
 };
 
 void fill(HDC dc,RECT rect,COLORREF color)
@@ -177,6 +177,7 @@ struct SettingsWindow::Impl {
         label(collectionLabel,L"Коллекция");
         create(renameCheck,L"BUTTON",L"Переименование и коллекция",BS_AUTOCHECKBOX);
         button(templatesButton,L"Редактор шаблонов…");
+        button(artistsButton,L"База художников…");
         label(backupLabel,L"Резервная копия и обмен");
         button(backupButton,L"Копия базы");button(exportButton,L"Экспорт JSON");button(importButton,L"Импорт JSON");
         label(quickLabel,L"Quick View в Проводнике");
@@ -257,7 +258,7 @@ struct SettingsWindow::Impl {
         }
         setText(c(statusText),state.updateStatus.empty()?L"Проверка обновлений ещё не выполнялась.":state.updateStatus);
         setText(c(versionText),L"Версия "+state.version);
-        for(int id:{templatesButton,backupButton,exportButton,importButton}) EnableWindow(c(id),state.renameEnabled);
+        for(int id:{templatesButton,artistsButton,backupButton,exportButton,importButton}) EnableWindow(c(id),state.renameEnabled);
         EnableWindow(c(checkButton),!state.updateBusy);
         EnableWindow(c(mediaButton),!state.updateBusy);
         EnableWindow(c(installButton),state.canInstall&&!state.updateBusy);
@@ -293,7 +294,7 @@ struct SettingsWindow::Impl {
             SelectObject(dc,oldFont);ReleaseDC(c(keyboardHint),dc);
             hintHeight=std::max(260,(static_cast<int>(textRect.bottom)*96+static_cast<int>(dpi)-1)/static_cast<int>(dpi)+8);
         }
-        const std::array pageHeights{330,185+hintHeight+16,340,280};
+        const std::array pageHeights{365,185+hintHeight+16,340,280};
         const int formHeight=std::max(viewHeight,pageHeights[static_cast<std::size_t>(tab)]);
         scrollLimit=std::max(0,formHeight-viewHeight);
         scrollOffset=std::clamp(scrollOffset,0,scrollLimit);
@@ -315,10 +316,11 @@ struct SettingsWindow::Impl {
             put(collectionLabel,14,12,inside,24);
             put(renameCheck,14,46,inside,31);
             put(templatesButton,14,91,inside,34);
-            put(backupLabel,14,154,inside,23);
+            put(artistsButton,14,135,inside,34);
+            put(backupLabel,14,198,inside,23);
             const int half=(inside-10)/2;
-            put(backupButton,14,190,half);put(exportButton,24+half,190,half);
-            put(importButton,14,232,inside);
+            put(backupButton,14,234,half);put(exportButton,24+half,234,half);
+            put(importButton,14,276,inside);
         } else if(tab==1) {
             put(quickLabel,14,12,inside,23);put(quickChoice,14,44,inside,190);
             put(groupLabel,14,96,inside,23);put(groupChoice,14,128,inside,130);
@@ -403,6 +405,7 @@ struct SettingsWindow::Impl {
             state.automaticUpdates=SendMessageW(c(id),BM_GETCHECK,0,0)==BST_CHECKED;
             emit(SettingsAction::automaticUpdates,state.automaticUpdates?1:0);return;
         case templatesButton:emit(SettingsAction::templates);return;
+        case artistsButton:emit(SettingsAction::artists);return;
         case backupButton:emit(SettingsAction::backupCollection);return;
         case exportButton:emit(SettingsAction::exportMetadata);return;
         case importButton:emit(SettingsAction::importMetadata);return;

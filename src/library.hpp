@@ -112,6 +112,16 @@ public:
     std::vector<MediaRecord> indexFiles(const std::vector<std::filesystem::path>& paths,
                                       std::stop_token cancellation = {});
     LibraryId saveArtist(Artist artist);
+    // Registry deletion only removes links. Artwork/version/file data and the
+    // physical files are retained, including links to coauthors.
+    void deleteArtist(const LibraryId& artist);
+    std::vector<RenamePreview> previewArtistRename(const Artist& updated) const;
+    // Apply one reviewed proposal per currently linked file (unchanged names
+    // included). expectedBefore is the original registry record reviewed by
+    // the caller; edits made since that snapshot reject the entire operation.
+    // Artist metadata and completed file paths share one journal and Undo.
+    RenameResult renameArtist(const Artist& expectedBefore, Artist updated, const std::vector<RenameProposal>& proposals,
+                              std::stop_token cancellation = {});
     LibraryId saveArtwork(Artwork artwork);
     LibraryId saveVersion(MediaVersion version);
     void saveFile(MediaRecord file);
