@@ -8,6 +8,8 @@
 #include "updater.hpp"
 #include "settings_window.hpp"
 #include "quick_space.hpp"
+#include "shell_selection.hpp"
+#include "artist_registry.hpp"
 
 #include <commctrl.h>
 #include <dwmapi.h>
@@ -54,13 +56,14 @@ constexpr UINT promoteMessage = WM_APP + 23;
 constexpr UINT libraryMessage = WM_APP + 24;
 constexpr UINT updateMessage = WM_APP + 25;
 constexpr UINT startupUpdateMessage = WM_APP + 26;
+constexpr UINT artistMessage=WM_APP+27;
 constexpr ULONG_PTR openMessage = 0x56574552;
 constexpr ULONG_PTR quickMessage = 0x56574551;
 constexpr UINT refreshTimer = 1;
 constexpr UINT canvasClickTimer = 2;
 constexpr UINT filenameTimer = 3;
 #ifndef VIEWERY_VERSION
-#define VIEWERY_VERSION "0.2.0-beta.3"
+#define VIEWERY_VERSION "0.2.0-beta.4"
 #endif
 
 constexpr COLORREF background = RGB(14, 16, 21);
@@ -81,7 +84,7 @@ enum class Control : UINT {
     open = 100, catalog, info, exportGif, more, previous, back, play, step, next, speed,
     zoom, fullScreen, pin, promote, close, compact, balanced, quality, cancel, copy,
     panelPosition, volume, preset, advanced, startExport, capture, counter, timestamp, renameStudio,
-    settings, catalogSelect, catalogArtists
+    settings, catalogSelect, catalogArtists, catalogReveal
 };
 
 constexpr std::array buttonLabels{
@@ -94,7 +97,7 @@ constexpr std::array buttonLabels{
     L"Сбалансированный", L"Расширенные настройки", L"Экспортировать",
     L"Стоп-кадр: ЛКМ — копировать, ПКМ — сохранить PNG",
     L"Переключить время и кадры", L"Вставить позицию таймлайна в выбранное поле",
-    L"Переименовать",L"Настройки",L"Выбор чекбоксами",L"Все файлы"
+    L"Переименовать",L"Настройки",L"Выбор чекбоксами",L"Все файлы",L"Показать выбранные файлы в Проводнике"
 };
 
 enum Menu : UINT {
@@ -107,13 +110,14 @@ enum Menu : UINT {
     groupNone, groupArtist, groupWork, groupFormat, groupDirectory,
     sortArtist, sortNumber, sortTitle, sortVersion, sortCustom, filterUnassigned, filterUntitled, filterUnorganized,
     libraryRefresh, groupKeysForward, groupKeysReverse, libraryOpenStudio, openSettings, openTemplates,
-    artistsAll, artistsGrouped
+    artistsAll, artistsGrouped, manageArtists
 };
 
 constexpr UINT rangeStartId = 600;
 constexpr UINT rangeEndId = 601;
 constexpr UINT volumeTrackId = 602;
 constexpr UINT catalogSearchId = 603;
+constexpr UINT catalogScrollId=604;
 
 enum FileMenu : UINT {
     filePreview=1100,fileReveal,fileCopyPath,fileCopyName,fileCopy,fileProperties,fileSelect,fileRename
@@ -144,6 +148,7 @@ std::wstring_view iconFor(Control control, bool paused, bool fullscreen, bool bo
     case Control::renameStudio: return L"\xE8AC";
     case Control::settings:return L"\xE713";
     case Control::catalogSelect:return L"\xE739";
+    case Control::catalogReveal:return L"\xE8DA";
     default: return {};
     }
 }
@@ -321,7 +326,7 @@ void menuItem(HMENU menu, UINT command, const wchar_t* name, bool selected = fal
 
 class App {
 public:
-    explicit App(HINSTANCE instance) : instance_(instance) {}
+    explicit App(HINSTANCE instance) : instance_(instance) {collectionOptions_.filenameArtists=true;}
     ~App();
 
     bool start();
@@ -336,6 +341,7 @@ public:
                                        UINT_PTR id, DWORD_PTR data);
     static LRESULT CALLBACK captureProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
                                         UINT_PTR id, DWORD_PTR data);
+    static LRESULT CALLBACK catalogScrollProc(HWND window,UINT message,WPARAM wparam,LPARAM lparam,UINT_PTR,DWORD_PTR data);
 
 private:
     bool makeViewer();
@@ -355,6 +361,14 @@ private:
     int strideY() const;
     int maxScroll() const;
     void scrollCatalog(int distance);
+    RECT catalogViewport() const;
+    void updateCatalogScroll();
+    void paintCatalogScroll(HWND window);
+    std::vector<fs::path> revealTargets() const;
+    void revealCatalogSelection();
+    void openArtistRegistry();
+    void acceptArtistChanges();
+    bool applyRenamedPaths(const std::vector<std::pair<fs::path,fs::path>>& changes);
 
     int dp(int value) const { return MulDiv(value, static_cast<int>(dpi_), 96); }
     void updateFonts();
@@ -449,6 +463,7 @@ private:
     std::unique_ptr<RenameStudio> studio_;
     std::unique_ptr<UpdateService> updates_;
     std::unique_ptr<SettingsWindow> settings_;
+    std::unique_ptr<ArtistRegistry> artists_;
     QuickSpaceGesture quickSpaceGesture_;
     UpdateInfo updateInfo_{};
     bool renameEnabled_=true,selectMode_=false;
@@ -464,6 +479,9 @@ private:
     int collectionExtent_=0;
     bool applyingCollection_=false;
     HWND catalogSearch_=nullptr;
+    HWND catalogScroll_=nullptr;
+    bool catalogScrollDragging_=false;
+    int catalogScrollOrigin_=0,catalogScrollStart_=0,catalogScrollHold_=0;
     std::vector<CatalogFile> directoryFiles_;
     std::map<UINT,std::pair<int,std::wstring>> catalogFilterCommands_;
     PlaybackState playback_{};
@@ -532,6 +550,7 @@ private:
 
 App::~App()
 {
+    artists_.reset();
     settings_.reset();
     studio_.reset();
     updates_.reset();
@@ -631,6 +650,98 @@ LRESULT CALLBACK App::captureProc(HWND window, UINT message, WPARAM wparam, LPAR
     return DefSubclassProc(window, message, wparam, lparam);
 }
 
+LRESULT CALLBACK App::catalogScrollProc(HWND window,UINT message,WPARAM wparam,LPARAM lparam,UINT_PTR,DWORD_PTR data)
+{
+    auto& app=*reinterpret_cast<App*>(data);
+    const bool horizontal=app.panel_==Panel::bottom;
+    if(message==WM_ERASEBKGND) return 1;
+    if(message==WM_PAINT) {app.paintCatalogScroll(window);return 0;}
+    if(message==WM_MOUSEWHEEL) return SendMessageW(app.window_,message,wparam,lparam);
+    if(message==WM_LBUTTONDOWN) {
+        SCROLLBARINFO info{sizeof(info)};
+        if(!GetScrollBarInfo(window,OBJID_CLIENT,&info)) return 0;
+        const int position=horizontal?GET_X_LPARAM(lparam):GET_Y_LPARAM(lparam);
+        RECT bounds{};GetClientRect(window,&bounds);
+        const int length=horizontal?spanX(bounds):spanY(bounds);
+        const int page=horizontal?spanX(app.catalogViewport()):spanY(app.catalogViewport());
+        SetCapture(window);
+        app.catalogScrollDragging_=position>=info.xyThumbTop&&position<info.xyThumbBottom;
+        app.catalogScrollOrigin_=position;app.catalogScrollStart_=app.scroll_;
+        if(!app.catalogScrollDragging_) {
+            app.catalogScrollHold_=position<info.dxyLineButton?-app.dp(42):position>=length-info.dxyLineButton?app.dp(42):
+                position<info.xyThumbTop?-page:page;
+            app.scrollCatalog(app.catalogScrollHold_);SetTimer(window,1,300,nullptr);
+        }
+        InvalidateRect(window,nullptr,FALSE);return 0;
+    }
+    if(message==WM_MOUSEMOVE&&GetCapture()==window&&app.catalogScrollDragging_) {
+        SCROLLBARINFO info{sizeof(info)};GetScrollBarInfo(window,OBJID_CLIENT,&info);
+        RECT bounds{};GetClientRect(window,&bounds);
+        const int length=horizontal?spanX(bounds):spanY(bounds);
+        const int travel=std::max(1,length-info.dxyLineButton*2-(info.xyThumbBottom-info.xyThumbTop));
+        const int position=horizontal?GET_X_LPARAM(lparam):GET_Y_LPARAM(lparam);
+        const auto offset=static_cast<long long>(position-app.catalogScrollOrigin_)*app.maxScroll()/travel;
+        const int target=static_cast<int>(std::clamp(static_cast<long long>(app.catalogScrollStart_)+offset,0LL,static_cast<long long>(app.maxScroll())));
+        app.scrollCatalog(target-app.scroll_);return 0;
+    }
+    if(message==WM_TIMER&&wparam==1&&GetCapture()==window) {
+        app.scrollCatalog(app.catalogScrollHold_);SetTimer(window,1,70,nullptr);return 0;
+    }
+    if(message==WM_LBUTTONUP||message==WM_CAPTURECHANGED) {
+        KillTimer(window,1);app.catalogScrollDragging_=false;app.catalogScrollHold_=0;
+        if(message==WM_LBUTTONUP&&GetCapture()==window) {ReleaseCapture();SetFocus(app.window_);}
+        InvalidateRect(window,nullptr,FALSE);return 0;
+    }
+    return DefSubclassProc(window,message,wparam,lparam);
+}
+
+void App::paintCatalogScroll(HWND window)
+{
+    PAINTSTRUCT paint{};HDC dc=BeginPaint(window,&paint);
+    RECT bounds{};GetClientRect(window,&bounds);fill(dc,bounds,surface);
+    SCROLLBARINFO info{sizeof(info)};
+    if(GetScrollBarInfo(window,OBJID_CLIENT,&info)) {
+        const bool horizontal=panel_==Panel::bottom;
+        RECT thumb=horizontal?RECT{info.xyThumbTop,dp(3),info.xyThumbBottom,bounds.bottom-dp(3)}:
+            RECT{dp(3),info.xyThumbTop,bounds.right-dp(3),info.xyThumbBottom};
+        if(!IsRectEmpty(&thumb)) rounded(dc,thumb,GetCapture()==window?accent:hint,GetCapture()==window?accent:hint,dp(6));
+        const int size=info.dxyLineButton;
+        const int middle=(horizontal?spanY(bounds):spanX(bounds))/2;
+        HPEN pen=CreatePen(PS_SOLID,std::max(1,dp(1)),hint);const auto old=SelectObject(dc,pen);
+        for(int end=0;end<2;++end) {
+            const int along=end?(horizontal?spanX(bounds):spanY(bounds))-size/2:size/2;
+            const int direction=end?1:-1;
+            if(horizontal) {MoveToEx(dc,along-direction*dp(2),middle-dp(3),nullptr);LineTo(dc,along+direction*dp(1),middle);LineTo(dc,along-direction*dp(2),middle+dp(3));}
+            else {MoveToEx(dc,middle-dp(3),along-direction*dp(2),nullptr);LineTo(dc,middle,along+direction*dp(1));LineTo(dc,middle+dp(3),along-direction*dp(2));}
+        }
+        SelectObject(dc,old);DeleteObject(pen);
+    }
+    EndPaint(window,&paint);
+}
+
+void App::updateCatalogScroll()
+{
+    if(!catalogScroll_) return;
+    const RECT view=catalogViewport();
+    const bool horizontal=panel_==Panel::bottom;
+    const bool visible=mode_==Mode::full&&!fullscreen_&&panel_!=Panel::hidden&&!IsRectEmpty(&view)&&maxScroll()>0;
+    if(!visible) {childVisible(catalogScroll_,false);return;}
+    const LONG_PTR style=GetWindowLongPtrW(catalogScroll_,GWL_STYLE);
+    const LONG_PTR next=(style&~static_cast<LONG_PTR>(SBS_VERT))|(horizontal?SBS_HORZ:SBS_VERT);
+    if(next!=style) SetWindowLongPtrW(catalogScroll_,GWL_STYLE,next);
+    const RECT bounds=horizontal?RECT{view.left,view.bottom,catalogRect_.right,catalogRect_.bottom}:
+        RECT{view.right,view.top,catalogRect_.right,view.bottom};
+    const bool moved=arrangeChild(catalogScroll_,bounds,true);
+    const int page=std::max(1,horizontal?spanX(view):spanY(view));
+    SCROLLINFO previous{sizeof(previous),SIF_RANGE|SIF_PAGE|SIF_POS};GetScrollInfo(catalogScroll_,SB_CTL,&previous);
+    SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE|SIF_POS};info.nMin=0;info.nMax=maxScroll()+page-1;
+    info.nPage=static_cast<UINT>(page);info.nPos=scroll_;
+    if(moved||next!=style||previous.nMax!=info.nMax||previous.nPage!=info.nPage||previous.nPos!=info.nPos) {
+        // Realize native thumb geometry before our WM_PAINT override reads it.
+        SetScrollInfo(catalogScroll_,SB_CTL,&info,TRUE);InvalidateRect(catalogScroll_,nullptr,FALSE);
+    }
+}
+
 bool App::start()
 {
     controller_ = CreateWindowExW(0, controllerClass, L"Viewery", WS_POPUP, 0, 0, 0, 0,
@@ -697,6 +808,12 @@ bool App::makeViewer()
                                   0,0,0,0,window_,reinterpret_cast<HMENU>(static_cast<UINT_PTR>(catalogSearchId)),
                                   instance_,nullptr);
     SendMessageW(catalogSearch_,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(L"Поиск"));
+    catalogScroll_=CreateWindowExW(0,L"SCROLLBAR",L"Прокрутка миниатюр",WS_CHILD|SBS_VERT,
+        0,0,0,0,window_,reinterpret_cast<HMENU>(static_cast<UINT_PTR>(catalogScrollId)),instance_,nullptr);
+    if(catalogScroll_) {
+        SetWindowTheme(catalogScroll_,L"DarkMode_Explorer",nullptr);
+        SetWindowSubclass(catalogScroll_,catalogScrollProc,1,reinterpret_cast<DWORD_PTR>(this));
+    }
     editBrush_ = CreateSolidBrush(raised);
     tooltip_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
                                0, 0, 0, 0, window_, nullptr, instance_, nullptr);
@@ -938,16 +1055,26 @@ bool App::acceptCatalog()
     return update.scanned;
 }
 
+RECT App::catalogViewport() const
+{
+    RECT view=catalogRect_;
+    if(IsRectEmpty(&view)) return {};
+    view.top=std::min(view.bottom,view.top+catalogHeaderHeight());
+    if(panel_==Panel::bottom) view.bottom=std::max(view.top,view.bottom-dp(15));
+    else view.right=std::max(view.left,view.right-dp(15));
+    return view;
+}
+
 int App::columns() const
 {
     if (panel_ == Panel::bottom || !cards_) return 1;
-    return std::max(1, (spanX(catalogRect_) - dp(20)) / dp(thumb_));
+    return std::max(1,(spanX(catalogViewport())-dp(20))/dp(thumb_));
 }
 
 int App::strideX() const
 {
     if (panel_ == Panel::bottom) return dp(thumb_);
-    return std::max(1, (spanX(catalogRect_) - dp(20)) / columns());
+    return std::max(1,(spanX(catalogViewport())-dp(20))/columns());
 }
 
 int App::strideY() const
@@ -963,28 +1090,32 @@ RECT App::itemRect(std::size_t index) const
         else OffsetRect(&rect,0,-scroll_);
         return rect;
     }
+    const RECT viewport=catalogViewport();
     const int count = static_cast<int>(index);
     if (panel_ == Panel::bottom) {
-        const int x = catalogRect_.left + dp(10) + count * strideX() - scroll_;
-        return {x, catalogRect_.top + catalogHeaderHeight(), x + strideX() - dp(7), catalogRect_.bottom - dp(9)};
+        const int x=viewport.left+dp(10)+count*strideX()-scroll_;
+        return {x,viewport.top,x+strideX()-dp(7),viewport.bottom-dp(9)};
     }
-    const int x = catalogRect_.left + dp(10) + (count % columns()) * strideX();
-    const int y = catalogRect_.top + catalogHeaderHeight() + (count / columns()) * strideY() - scroll_;
+    const int x=viewport.left+dp(10)+(count%columns())*strideX();
+    const int y=viewport.top+(count/columns())*strideY()-scroll_;
     return {x, y, x + strideX() - dp(6), y + strideY() - dp(6)};
 }
 
 int App::maxScroll() const
 {
+    const RECT viewport=catalogViewport();
     if(groupedCatalog()) return std::max(0,collectionExtent_-
-        (panel_==Panel::bottom?spanX(catalogRect_):spanY(catalogRect_)));
+        (panel_==Panel::bottom?spanX(viewport):spanY(viewport)));
     const int count = static_cast<int>(files_.size());
-    if (panel_ == Panel::bottom) return std::max(0, count * strideX() + dp(12) - spanX(catalogRect_));
-    return std::max(0, ((count + columns() - 1) / columns()) * strideY() + catalogHeaderHeight()+dp(8)-spanY(catalogRect_));
+    if(panel_==Panel::bottom) return std::max(0,count*strideX()+dp(12)-spanX(viewport));
+    return std::max(0,((count+columns()-1)/columns())*strideY()+dp(8)-spanY(viewport));
 }
 
 void App::scrollCatalog(int distance)
 {
-    scroll_ = std::clamp(scroll_ + distance, 0, maxScroll());
+    const int next=std::clamp(scroll_+distance,0,maxScroll());
+    if(next==scroll_) return;
+    scroll_=next;updateCatalogScroll();
     requestThumbnails();
     InvalidateRect(window_, &catalogRect_, FALSE);
 }
@@ -996,16 +1127,18 @@ void App::revealSelection()
     });
     current_ = item == files_.end() ? -1 : static_cast<int>(item - files_.begin());
     if (current_ >= 0 && panel_ != Panel::hidden && !IsRectEmpty(&catalogRect_)) {
+        const RECT viewport=catalogViewport();
         const RECT itemBounds = itemRect(static_cast<std::size_t>(current_));
         if (panel_ == Panel::bottom) {
-            if (itemBounds.left < catalogRect_.left) scroll_ += itemBounds.left - catalogRect_.left - dp(8);
-            if (itemBounds.right > catalogRect_.right) scroll_ += itemBounds.right - catalogRect_.right + dp(8);
+            if(itemBounds.left<viewport.left) scroll_+=itemBounds.left-viewport.left-dp(8);
+            if(itemBounds.right>viewport.right) scroll_+=itemBounds.right-viewport.right+dp(8);
         } else {
-            if (itemBounds.top < catalogRect_.top + catalogHeaderHeight()) scroll_ += itemBounds.top - catalogRect_.top - catalogHeaderHeight();
-            if (itemBounds.bottom > catalogRect_.bottom) scroll_ += itemBounds.bottom - catalogRect_.bottom + dp(8);
+            if(itemBounds.top<viewport.top) scroll_+=itemBounds.top-viewport.top;
+            if(itemBounds.bottom>viewport.bottom) scroll_+=itemBounds.bottom-viewport.bottom+dp(8);
         }
     }
     scroll_ = std::clamp(scroll_, 0, maxScroll());
+    updateCatalogScroll();
     requestThumbnails();
 }
 
@@ -1022,7 +1155,7 @@ void App::requestThumbnails()
     std::set<fs::path> visible;
     for (int index = first; index < limit && index < static_cast<int>(files_.size()); ++index) {
         if(groupedCatalog()) {
-            auto viewport=catalogRect_;
+            auto viewport=catalogViewport();
             InflateRect(&viewport,dp(200),dp(200));
             RECT intersection{};
             const auto rect=itemRect(static_cast<std::size_t>(index));
@@ -1154,17 +1287,20 @@ void App::layout()
         }
     }
     const bool searchVisible=fullUi&&studio_&&renameEnabled_&&panel_!=Panel::hidden;
-    if(fullUi&&renameEnabled_&&panel_!=Panel::hidden) {
-        const auto putCatalog=[&](Control control,RECT bounds) {
+    if(fullUi&&panel_!=Panel::hidden) {
+        const auto putCatalog=[&](Control control,RECT bounds,bool enabled=true) {
             visible[static_cast<UINT>(control)-static_cast<UINT>(Control::open)]=TRUE;
-            place(control,bounds.left,bounds.top,spanX(bounds),spanY(bounds));
+            place(control,bounds.left,bounds.top,spanX(bounds),spanY(bounds),enabled);
         };
+        putCatalog(Control::catalogReveal,{catalogRect_.right-dp(renameEnabled_?92:60),catalogRect_.top+dp(2),catalogRect_.right-dp(renameEnabled_?64:32),catalogRect_.top+dp(28)},!revealTargets().empty());
+        if(renameEnabled_) {
         putCatalog(Control::catalogSelect,{catalogRect_.right-dp(61),catalogRect_.top+dp(2),catalogRect_.right-dp(33),catalogRect_.top+dp(28)});
         putCatalog(Control::catalogArtists,{catalogRect_.left+dp(8),catalogRect_.top+dp(33),catalogRect_.right-dp(8),catalogRect_.top+dp(59)});
         const auto caption=collectionOptions_.group==CollectionGroup::artist?L"Художники ▾":L"Все файлы ▾";
         const HWND artistsButton=buttons_[static_cast<UINT>(Control::catalogArtists)-static_cast<UINT>(Control::open)];
         wchar_t old[64]{};GetWindowTextW(artistsButton,old,64);
         if(wcscmp(old,caption)) SetWindowTextW(artistsButton,caption);
+        }
     }
     if(searchVisible) {
         arrangeChild(catalogSearch_,{catalogRect_.left+dp(8),catalogRect_.top+dp(65),catalogRect_.right-dp(8),catalogRect_.top+dp(90)},true);
@@ -1284,6 +1420,7 @@ void App::layout()
     arrangeChild(video_,mediaRect_,showMedia);
     layoutCollectionTiles();
     scroll_ = std::clamp(scroll_, 0, maxScroll());
+    updateCatalogScroll();
     requestThumbnails();
     updateCounter();
     InvalidateRect(window_, nullptr, FALSE);
@@ -1361,16 +1498,17 @@ void App::paintCatalog(HDC dc)
 {
     if (IsRectEmpty(&catalogRect_)) return;
     fill(dc, catalogRect_, surface);
-    const RECT title{catalogRect_.left + dp(11), catalogRect_.top,
-                     catalogRect_.right - dp(renameEnabled_?68:10), catalogRect_.top + dp(30)};
-    label(dc, L"Каталог", title, textColor);
+    const RECT title{catalogRect_.left + dp(9), catalogRect_.top,
+                     catalogRect_.right - dp(renameEnabled_?94:62), catalogRect_.top + dp(30)};
     const auto count=std::to_wstring(studio_&&renameEnabled_?collectionView_.fileCount:files_.size());
     const auto selected=selectedFiles_.empty()?L"":L" · ✓"+std::to_wstring(selectedFiles_.size());
-    const RECT countRect{catalogRect_.left+dp(78),catalogRect_.top,catalogRect_.right-dp(renameEnabled_?67:28),catalogRect_.top+dp(30)};
-    if(spanX(countRect)>dp(30)) label(dc,count+selected,countRect,hint,DT_RIGHT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+    const auto caption=spanX(title)>=dp(140)?L"Каталог · "+count+selected:
+        spanX(title)>=dp(100)?L"Файлы · "+count:L"Файлы";
+    label(dc,caption,title,textColor);
     label(dc,L"···",{catalogRect_.right-dp(29),catalogRect_.top,catalogRect_.right-dp(6),catalogRect_.top+dp(30)},hint,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     const int saved = SaveDC(dc);
-    IntersectClipRect(dc, catalogRect_.left, catalogRect_.top+catalogHeaderHeight(), catalogRect_.right, catalogRect_.bottom);
+    const RECT viewport=catalogViewport();
+    IntersectClipRect(dc, viewport.left, viewport.top, viewport.right, viewport.bottom);
     if(groupedCatalog()) for(const auto& [bounds,entry]:collectionHeaders_) {
         auto rect=bounds;
         if(panel_==Panel::bottom) OffsetRect(&rect,-scroll_,0);else OffsetRect(&rect,0,-scroll_);
@@ -1389,7 +1527,7 @@ void App::paintCatalog(HDC dc)
         const auto& file = files_[static_cast<std::size_t>(index)];
         const RECT rect = itemRect(static_cast<std::size_t>(index));
         RECT intersection{};
-        if(!IntersectRect(&intersection,&rect,&catalogRect_)) continue;
+        if(!IntersectRect(&intersection,&rect,&viewport)) continue;
         const bool selectedFile=selectedFiles_.contains(file.path);
         rounded(dc, rect, selectedFile?RGB(38,51,65):index == current_ ? activeSurface : background,
                 index == current_ ? accent : border, dp(10));
@@ -1645,6 +1783,8 @@ void App::refresh()
         playback_ = std::move(next);
         if(resumePlayback_&&playback_.ready) {
             const auto resume=std::exchange(resumePlayback_,std::nullopt);
+            player_->changeVolume(resume->volume-playback_.volume);
+            player_->changeZoom(std::log2(std::max(0.25,resume->zoom)/std::max(0.25,playback_.zoom)));
             if(kind_!=MediaKind::image) {
                 player_->seekAbsolute(resume->position);
                 if(playback_.paused!=resume->paused) player_->togglePause();
@@ -1982,7 +2122,7 @@ bool App::key(WPARAM code, bool alt)
         if(shift&&player_&&kind_!=MediaKind::image) player_->seekRelative(direction*5.0);
         else if(alt&&player_&&kind_==MediaKind::image) player_->pan(direction*0.08,0.0);
         else if(alt&&player_) player_->stepFrame(direction);
-        else if(!ctrl) navigateKey(code);
+        else if(!alt&&!ctrl) navigateKey(code);
         return true;
     }
     if((code==VK_UP||code==VK_DOWN)&&!alt&&!ctrl) {navigateKey(code);return true;}
@@ -2118,6 +2258,7 @@ void App::settingsEvent(const SettingsEvent& event)
     case SettingsAction::releaseNotes:command(updatesNotes);break;
     case SettingsAction::mediaTools:command(mediaToolsInstall);break;
     case SettingsAction::templates:command(openTemplates);break;
+    case SettingsAction::artists:command(manageArtists);break;
     case SettingsAction::backupCollection:case SettingsAction::exportMetadata:case SettingsAction::importMetadata:
         if(!renameEnabled_) {MessageBoxW(settings_->window(),L"Включите модуль коллекции для работы с базой.",L"Коллекция",MB_OK);break;}
         ensureStudio();
@@ -2141,12 +2282,79 @@ void App::syncStudio()
 
 void App::beforeLibraryChanges()
 {
-    if(exportThread_.joinable()) throw LibraryError("Finish GIF export before renaming files");
+    if(exportThread_.joinable()) throw LibraryError("Завершите экспорт GIF перед переименованием файлов");
+    if(artists_&&artists_->busy()) throw LibraryError("Завершите операцию с художником перед переименованием файлов");
     libraryChangesPending_=true;
     if(player_) {
         resumePlayback_=player_->poll();
         player_.reset();
     }
+}
+
+bool App::applyRenamedPaths(const std::vector<std::pair<fs::path,fs::path>>& changes)
+{
+    // Resolve every original path once: chains and cycles must not move A twice.
+    const auto mapped=[&](const fs::path& original) {
+        for(const auto& [before,after]:changes) if(samePath(original,before)) return after;
+        return original;
+    };
+    const auto viewed=mapped(path_);
+    const bool moved=viewed!=path_;
+    path_=viewed;
+    std::set<fs::path> selected;
+    for(const auto& file:selectedFiles_) selected.insert(mapped(file));
+    selectedFiles_=std::move(selected);
+    for(auto* entries:{&directoryFiles_,&files_}) for(auto& entry:*entries) {
+        entry.path=mapped(entry.path);entry.name=entry.path.filename().wstring();
+        entry.extension=entry.path.extension().wstring();
+    }
+    decltype(thumbnails_) thumbnails;
+    for(auto& [file,thumbnail]:thumbnails_) thumbnails.emplace(mapped(file),std::move(thumbnail));
+    thumbnails_=std::move(thumbnails);requested_.clear();
+    filenameSince_=GetTickCount64();updateTitle();
+    return moved;
+}
+
+std::vector<fs::path> App::revealTargets() const
+{
+    if(!selectedFiles_.empty()) return {selectedFiles_.begin(),selectedFiles_.end()};
+    return path_.empty()?std::vector<fs::path>{}:std::vector<fs::path>{path_};
+}
+
+void App::revealCatalogSelection()
+{
+    const auto files=revealTargets();
+    if(!files.empty()&&FAILED(revealInExplorer(files)))
+        MessageBoxW(window_,L"Не удалось выделить файлы в Проводнике. Возможно, файл был перемещён.",L"Расположение файлов",MB_OK|MB_ICONWARNING);
+}
+
+void App::openArtistRegistry()
+{
+    if(!renameEnabled_) return;
+    if(!window_&&!makeViewer()) return;
+    if(!artists_) artists_=std::make_unique<ArtistRegistry>(window_,artistMessage,[this] {
+        if(studio_&&(studio_->busy()||studio_->queuedFileCount()))
+            throw LibraryError("Завершите или очистите очередь переименования перед изменением художника");
+        beforeLibraryChanges();
+    });
+    artists_->show(dpi_);
+}
+
+void App::acceptArtistChanges()
+{
+    if(!artists_) return;
+    if(const auto changes=artists_->takeFileChanges()) {
+        applyRenamedPaths(changes->changes);
+        if(!changes->message.empty()) status_=changes->message;
+    }
+    if(std::exchange(libraryChangesPending_,false)) {
+        const auto file=path_;
+        if(!file.empty()&&!player_) openMedia(file);
+        if(catalog_) catalog_->scan(directory_,++generation_);
+    }
+    collectionOptions_.filter.artist.clear();
+    if(studio_) {syncStudio();studio_->refreshCollection();}
+    rebuildCollectionView();layout();
 }
 
 void App::acceptLibraryChanges()
@@ -2155,10 +2363,7 @@ void App::acceptLibraryChanges()
     const auto changes=studio_->takeFileChanges();
     bool viewedFileMoved=false;
     if(changes) {
-        for(const auto& [oldPath,newPath]:changes->changes) {
-            if(samePath(path_,oldPath)) {path_=newPath;viewedFileMoved=true;}
-            if(selectedFiles_.erase(oldPath)) selectedFiles_.insert(newPath);
-        }
+        viewedFileMoved=applyRenamedPaths(changes->changes);
         if(!changes->message.empty()) status_=changes->message;
     }
     if(std::exchange(libraryChangesPending_,false)) {
@@ -2166,6 +2371,7 @@ void App::acceptLibraryChanges()
         if(!path.empty()&&(!player_||viewedFileMoved)) openMedia(path);
         catalog_->scan(directory_,++generation_);
     }
+    if(artists_) artists_->refresh();
     rebuildCollectionView();
     if(disableStudioPending_&&!studio_->busy()) {
         disableStudioPending_=false;
@@ -2206,25 +2412,26 @@ void App::layoutCollectionTiles()
     collectionFileRects_.clear();
     collectionHeaders_.clear();
     collectionExtent_=0;
-    if(!groupedCatalog()||IsRectEmpty(&catalogRect_)) return;
+    const RECT viewport=catalogViewport();
+    if(!groupedCatalog()||IsRectEmpty(&viewport)) return;
     const bool bottom=panel_==Panel::bottom;
-    int cursor=bottom?dp(10):catalogHeaderHeight();
+    int cursor=bottom?dp(10):0;
     for(const auto& entry:collectionView_.rows) {
         const int indent=bottom?0:dp(6+static_cast<int>(entry.ancestorKeys.size())*7);
         if(entry.group) {
             RECT rect;
-            if(bottom) rect={catalogRect_.left+cursor,catalogRect_.top+catalogHeaderHeight(),
-                catalogRect_.left+cursor+dp(166),catalogRect_.bottom-dp(7)};
-            else rect={catalogRect_.left+indent,catalogRect_.top+cursor,catalogRect_.right-dp(7),
-                catalogRect_.top+cursor+dp(27)};
+            if(bottom) rect={viewport.left+cursor,viewport.top,
+                viewport.left+cursor+dp(166),viewport.bottom-dp(7)};
+            else rect={viewport.left+indent,viewport.top+cursor,viewport.right-dp(7),
+                viewport.top+cursor+dp(27)};
             collectionHeaders_.emplace_back(rect,entry);
             cursor+=bottom?dp(173):dp(30);
         } else {
             RECT rect;
-            if(bottom) rect={catalogRect_.left+cursor,catalogRect_.top+catalogHeaderHeight(),
-                catalogRect_.left+cursor+dp(thumb_-7),catalogRect_.bottom-dp(7)};
-            else rect={catalogRect_.left+indent,catalogRect_.top+cursor,catalogRect_.right-dp(7),
-                catalogRect_.top+cursor+strideY()-dp(6)};
+            if(bottom) rect={viewport.left+cursor,viewport.top,
+                viewport.left+cursor+dp(thumb_-7),viewport.bottom-dp(7)};
+            else rect={viewport.left+indent,viewport.top+cursor,viewport.right-dp(7),
+                viewport.top+cursor+strideY()-dp(6)};
             collectionFileRects_.push_back(rect);
             cursor+=bottom?dp(thumb_):strideY();
         }
@@ -2239,7 +2446,8 @@ RECT App::checkboxRect(RECT item) const
 
 int App::catalogItemAt(POINT point) const
 {
-    if(!PtInRect(&catalogRect_,point)||point.y<catalogRect_.top+catalogHeaderHeight()) return -1;
+    const auto viewport=catalogViewport();
+    if(!PtInRect(&viewport,point)) return -1;
     if(groupedCatalog()) {
         for(std::size_t index=0;index<files_.size();++index) {
             const auto bounds=itemRect(index);
@@ -2439,19 +2647,7 @@ void App::fileCommand(UINT action,const fs::path& file)
         return;
     }
     case fileReveal: {
-        PIDLIST_ABSOLUTE item=nullptr;
-        HRESULT result=SHParseDisplayName(file.c_str(),nullptr,&item,0,nullptr);
-        if(SUCCEEDED(result)) {
-            PIDLIST_ABSOLUTE folder=ILCloneFull(item);
-            if(folder) {
-                if(ILRemoveLastID(folder)) {
-                    PCUITEMID_CHILD child=ILFindLastID(item);
-                    result=SHOpenFolderAndSelectItems(folder,1,&child,0);
-                } else result=E_INVALIDARG;
-                CoTaskMemFree(folder);
-            } else result=E_OUTOFMEMORY;
-            CoTaskMemFree(item);
-        }
+        const HRESULT result=revealInExplorer({file});
         if(FAILED(result)) MessageBoxW(window_,L"Не удалось показать файл в Проводнике.",L"Расположение файла",MB_OK|MB_ICONWARNING);
         return;
     }
@@ -2466,7 +2662,8 @@ void App::artistMenu(POINT point)
     HMENU menu=CreatePopupMenu();
     menuItem(menu,artistsAll,L"Все файлы",collectionOptions_.group!=CollectionGroup::artist);
     menuItem(menu,artistsGrouped,L"Группы художников · по имени",collectionOptions_.group==CollectionGroup::artist&&collectionOptions_.filter.artist.empty());
-    CollectionViewOptions options;options.group=CollectionGroup::artist;options.sort=CollectionSort::artist;
+    menuItem(menu,manageArtists,L"База художников…");
+    CollectionViewOptions options;options.group=CollectionGroup::artist;options.sort=CollectionSort::artist;options.filenameArtists=true;
     std::vector<fs::path> paths;for(const auto& file:directoryFiles_) paths.push_back(file.path);
     const auto artists=buildCollectionView(studio_->snapshot(),paths,options);
     catalogFilterCommands_.clear();UINT action=10000;
@@ -2623,6 +2820,8 @@ void App::command(UINT id)
         return;
     case static_cast<UINT>(Control::catalogSelect):command(selectionMode);return;
     case static_cast<UINT>(Control::catalogArtists):artistMenu(controlPoint(Control::catalogArtists));return;
+    case static_cast<UINT>(Control::catalogReveal):revealCatalogSelection();return;
+    case manageArtists:openArtistRegistry();return;
     case artistsAll:
         ensureStudio();collectionOptions_.filter={};collectionOptions_.group=CollectionGroup::none;collectionOptions_.sort=CollectionSort::name;
         SetWindowTextW(catalogSearch_,L"");rebuildCollectionView();scroll_=0;savePreferences();layout();return;
@@ -2652,6 +2851,7 @@ void App::command(UINT id)
         const DWORD enabled=renameEnabled_?1:0;
         RegSetKeyValueW(HKEY_CURRENT_USER,L"Software\\Viewery",L"RenameStudioEnabled",REG_DWORD,&enabled,sizeof(enabled));
         if(!renameEnabled_) {
+            if(artists_) artists_->hide();
             detail_=Detail::none;selectedFiles_.clear();selectMode_=false;
             if(studio_&&studio_->templatesWindow()) SendMessageW(studio_->templatesWindow(),WM_CLOSE,0,0);
             if(studio_&&studio_->busy()) {studio_->cancel();studio_->hide();disableStudioPending_=true;}
@@ -2692,7 +2892,7 @@ void App::command(UINT id)
         if(studio_&&studio_->queuedFileCount()) {
             MessageBoxW(window_,L"Сначала переименуйте подготовленные файлы или очистите очередь. Обновление перезапускает приложение.",L"Очередь переименования",MB_OK);return;
         }
-        if(exportThread_.joinable()||(studio_&&studio_->busy())) {
+        if(exportThread_.joinable()||(studio_&&studio_->busy())||(artists_&&artists_->busy())) {
             MessageBoxW(window_,L"Завершите экспорт или обработку коллекции перед обновлением.",L"Обновление",MB_OK);return;
         }
         if(MessageBoxW(window_?window_:controller_,L"Установить обновление Viewery? Приложение будет закрыто для обновления. После установки запустите его снова.",
@@ -2766,6 +2966,9 @@ void App::command(UINT id)
     case hotkeyCtrlShift: changeShortcut(PreviewHotkey::ctrl_shift_space); return;
     case hotkeyOff: changeShortcut(PreviewHotkey::disabled); return;
     case quit:
+        if(artists_&&artists_->busy()) {
+            MessageBoxW(window_?window_:controller_,L"Дождитесь завершения операции с художником.",L"База художников",MB_OK);return;
+        }
         if(studio_&&studio_->queuedFileCount()&&MessageBoxW(window_?window_:controller_,
             L"В очереди есть подготовленные имена. Завершить Viewery и очистить очередь?",L"Очередь переименования",
             MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)!=IDYES) return;
@@ -3009,7 +3212,7 @@ LRESULT App::dispatch(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
     case WM_PAINT: paint(); return 0;
     case WM_DRAWITEM:
         if (wparam >= static_cast<UINT>(Control::open) &&
-            wparam <= static_cast<UINT>(Control::catalogArtists)) {
+            wparam <= static_cast<UINT>(Control::catalogReveal)) {
             paintButton(*reinterpret_cast<const DRAWITEMSTRUCT*>(lparam));
             return TRUE;
         }
@@ -3020,7 +3223,25 @@ LRESULT App::dispatch(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
             return paintVolume(*reinterpret_cast<const NMCUSTOMDRAW*>(lparam));
         }
         break;
-    case WM_HSCROLL:
+    case WM_VSCROLL:case WM_HSCROLL:
+        if(reinterpret_cast<HWND>(lparam)==catalogScroll_) {
+            const bool horizontal=panel_==Panel::bottom;
+            const int page=horizontal?spanX(catalogViewport()):spanY(catalogViewport());
+            int target=scroll_;
+            switch(LOWORD(wparam)) {
+            case SB_LINEUP:target-=dp(42);break;
+            case SB_LINEDOWN:target+=dp(42);break;
+            case SB_PAGEUP:target-=page;break;
+            case SB_PAGEDOWN:target+=page;break;
+            case SB_TOP:target=0;break;
+            case SB_BOTTOM:target=maxScroll();break;
+            case SB_THUMBPOSITION:case SB_THUMBTRACK: {
+                SCROLLINFO info{sizeof(info),SIF_TRACKPOS};GetScrollInfo(catalogScroll_,SB_CTL,&info);
+                target=info.nTrackPos;break;
+            }
+            }
+            scrollCatalog(std::clamp(target,0,maxScroll())-scroll_);return 0;
+        }
         if (reinterpret_cast<HWND>(lparam) == volumeTrack_) {
             setVolume(static_cast<double>(SendMessageW(volumeTrack_, TBM_GETPOS, 0, 0)));
             return 0;
@@ -3054,7 +3275,7 @@ LRESULT App::dispatch(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
             return 0;
         }
         if (LOWORD(wparam) >= static_cast<UINT>(Control::open) &&
-            LOWORD(wparam) <= static_cast<UINT>(Control::catalogArtists) && HIWORD(wparam) == BN_CLICKED) {
+            LOWORD(wparam) <= static_cast<UINT>(Control::catalogReveal) && HIWORD(wparam) == BN_CLICKED) {
             command(LOWORD(wparam));
             return 0;
         }
@@ -3081,6 +3302,7 @@ LRESULT App::dispatch(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
         break;
     case catalogMessage: if (acceptCatalog()) layout(); return 0;
     case libraryMessage:acceptLibraryChanges();return 0;
+    case artistMessage:acceptArtistChanges();return 0;
     case exportMessage: acceptExport(); return 0;
     case promoteMessage:
         if (std::exchange(promotionPending_, false) && mode_ == Mode::quick && IsWindowVisible(window)) {
@@ -3172,6 +3394,7 @@ int App::run()
 {
     MSG event{};
     while (GetMessageW(&event, nullptr, 0, 0) > 0) {
+        if(artists_&&artists_->processMessage(event)) continue;
         if(settings_&&settings_->processMessage(event)) continue;
         if(studio_&&studio_->processMessage(event)) continue;
         const bool studioInput=studio_&&(event.hwnd==studio_->window()||IsChild(studio_->window(),event.hwnd));

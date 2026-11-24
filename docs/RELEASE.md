@@ -11,10 +11,10 @@ cmake -S . -B build-release -G "Visual Studio 17 2022" -A x64 -DVIEWERY_MEDIA_TE
 cmake --build build-release --config Release --parallel
 ./scripts/Get-MediaTools.ps1 -Destination build-release/bin/Release -IncludeProbe
 ctest --test-dir build-release -C Release --output-on-failure
-./scripts/Build-Release.ps1 -BuildDirectory build-release/bin/Release -Destination dist -Version 0.2.0-beta.1
+./scripts/Build-Release.ps1 -BuildDirectory build-release/bin/Release -Destination dist -Version 0.2.0-beta.4
 ```
 
-Пакет `Viewery-0.2.0-beta.1-Windows-x64-portable.zip` содержит только приложение, shell DLL, README, CHANGELOG, инструкции, лицензии и скрипт с проверяемыми SHA-256. Пользователь распаковывает пакет в постоянный каталог, запускает `Viewery.exe` и выбирает установку медиакомпонентов в меню. Для классического ПКМ и фонового Quick View запустите скрипт интеграции Проводника по инструкции README. Компоненты устанавливаются в `%LOCALAPPDATA%\Viewery\MediaTools`, данные коллекции — в `%LOCALAPPDATA%\Viewery`, настройки — в `HKCU\Software\Viewery`.
+Пакет `Viewery-0.2.0-beta.4-Windows-x64-portable.zip` содержит только приложение, shell DLL, README, CHANGELOG, инструкции, лицензии и скрипт с проверяемыми SHA-256. Пользователь распаковывает пакет в постоянный каталог, запускает `Viewery.exe` и выбирает установку медиакомпонентов в меню. Для классического ПКМ и фонового Quick View запустите скрипт интеграции Проводника по инструкции README. Компоненты устанавливаются в `%LOCALAPPDATA%\Viewery\MediaTools`, данные коллекции — в `%LOCALAPPDATA%\Viewery`, настройки — в `HKCU\Software\Viewery`.
 
 Portable проверяет наличие версии и показывает заметки релиза. Автоматическая замена portable EXE не выполняется. Установка обновления из приложения доступна для подписанной версии, установленной через `.appinstaller`.
 
@@ -25,7 +25,7 @@ Portable проверяет наличие версии и показывает 
 3. Для локальной сборки сертификат должен быть доступен в `Cert:\CurrentUser\My`. Передать его thumbprint:
 
 ```powershell
-./scripts/Build-Release.ps1 -BuildDirectory build-release/bin/Release -Destination dist-signed -Version 0.2.0-beta.1 -SigningThumbprint YOUR_40_DIGIT_THUMBPRINT
+./scripts/Build-Release.ps1 -BuildDirectory build-release/bin/Release -Destination dist-signed -Version 0.2.0-beta.4 -SigningThumbprint YOUR_40_DIGIT_THUMBPRINT
 ```
 
 Скрипт подписывает и проверяет EXE, shell DLL и MSIX через SignTool с SHA-256 и RFC 3161 timestamp. Он сохраняет подпись в готовом portable ZIP и генерирует рабочий `Viewery.appinstaller` только после успешной подписи. MakeAppx выполняет проверку схемы и содержимого, `/nv` не используется. При отсутствии сертификата создаются `.unsigned.msix` и `.appinstaller.template.xml`.
@@ -46,7 +46,7 @@ Portable проверяет наличие версии и показывает 
 
 После успешной подписи workflow также публикует:
 
-- Неизменяемый пакет `releases/download/v0.2.0-beta.1/Viewery-0.2.0-beta.1-x64.msix`.
+- Неизменяемый пакет `releases/download/v0.2.0-beta.4/Viewery-0.2.0-beta.4-x64.msix`.
 - Канал `releases/download/updates-beta/Viewery.appinstaller` либо `updates-stable`.
 
 GitHub `latest` не используется для beta. Канальный релиз содержит только текущий AppInstaller; содержимое `.appinstaller` указывает на конкретную подписанную версию. Канальный тег не является семантической версией и игнорируется проверкой наличия обновления.

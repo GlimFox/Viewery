@@ -118,7 +118,7 @@ void checkStableLayout(viewery::App& app)
     std::vector<HWND> watched;
     for (const auto id : {Control::open, Control::catalog, Control::panelPosition, Control::renameStudio,
                           Control::info, Control::exportGif, Control::settings, Control::more,
-                          Control::catalogSelect, Control::catalogArtists}) {
+                          Control::catalogSelect, Control::catalogArtists, Control::catalogReveal}) {
         HWND child = app.buttons_[static_cast<UINT>(id) - static_cast<UINT>(Control::open)];
         if (child && IsWindowVisible(child)) {
             require(SetWindowSubclass(child, countButtonActivity, 72, reinterpret_cast<DWORD_PTR>(&count)) != FALSE,
@@ -138,7 +138,7 @@ void checkStableLayout(viewery::App& app)
     watched.clear();
     for (const auto id : {Control::open, Control::catalog, Control::panelPosition, Control::renameStudio,
                           Control::info, Control::exportGif, Control::settings, Control::more,
-                          Control::catalogSelect, Control::catalogArtists}) {
+                          Control::catalogSelect, Control::catalogArtists, Control::catalogReveal}) {
         HWND child = app.buttons_[static_cast<UINT>(id) - static_cast<UINT>(Control::open)];
         if (child && IsWindowVisible(child)) {
             SetWindowSubclass(child, countButtonActivity, 72, reinterpret_cast<DWORD_PTR>(&count));
@@ -293,6 +293,133 @@ void checkQuickImageSpace(viewery::App& app)
     require(!IsWindowVisible(app.window_) && !app.player_ && app.path_.empty(), "a rapid second physical Space closes Quick View and releases media");
 }
 
+void checkCatalogScrollbar(viewery::App& app, const std::vector<std::filesystem::path>& paths)
+{
+    using namespace viewery;
+    const auto originalFiles=app.files_;
+    const auto originalPanel=app.panel_;
+    const auto originalDetail=app.detail_;
+    const auto originalCards=app.cards_;
+    const auto originalThumb=app.thumb_;
+    const auto originalWidth=app.catalogWidth_;
+    const auto originalHeight=app.catalogHeight_;
+    const auto originalOptions=app.collectionOptions_;
+    const auto originalScroll=app.scroll_;
+    const auto selected=app.selectedFiles_;
+    const auto viewed=app.path_;
+    app.mode_=Mode::full;app.fullscreen_=false;app.detail_=Detail::none;
+    app.collectionOptions_.group=CollectionGroup::none;
+    app.cards_=true;app.thumb_=150;app.catalogWidth_=250;app.catalogHeight_=156;
+    app.files_.clear();
+    for(int index=0;index<10000;++index) {
+        CatalogFile file;file.path=paths.front().parent_path()/(L"synthetic-"+std::to_wstring(index)+L".png");
+        file.name=file.path.filename().wstring();file.extension=L".png";app.files_.push_back(std::move(file));
+    }
+    for(const auto panel:{Panel::left,Panel::bottom}) {
+        app.panel_=panel;app.scroll_=0;app.layout();finishPaint(app.window_);
+        const bool horizontal=panel==Panel::bottom;
+        const auto bar=app.catalogScroll_;
+        require(bar&&IsWindowVisible(bar),"overflowing catalog exposes a dedicated native scrollbar");
+        require(((GetWindowLongPtrW(bar,GWL_STYLE)&SBS_VERT)==0)==horizontal,
+            "scrollbar orientation follows left panel and bottom filmstrip");
+        const auto viewport=app.catalogViewport(),bounds=localRect(app.window_,bar);
+        require(horizontal?viewport.bottom==bounds.top:viewport.right==bounds.left,
+            "thumbnail viewport reserves a separate strip for the scrollbar");
+        require(app.catalogItemAt({(bounds.left+bounds.right)/2,(bounds.top+bounds.bottom)/2})==-1,
+            "scrollbar never hit-tests as a thumbnail");
+        SCROLLINFO range{sizeof(range),SIF_RANGE|SIF_PAGE|SIF_POS};
+        require(GetScrollInfo(bar,SB_CTL,&range)&&app.maxScroll()>65535&&
+            range.nMax-static_cast<int>(range.nPage)+1==app.maxScroll(),
+            "native scrollbar retains the full range for ten thousand thumbnails beyond 16 bits");
+        RECT client{};GetClientRect(bar,&client);
+        SCROLLBARINFO info{sizeof(info)};
+        const auto hasThumb=GetScrollBarInfo(bar,OBJID_CLIENT,&info);
+        if(!hasThumb||info.xyThumbBottom<=info.xyThumbTop) std::cout<<"Scrollbar info: horizontal="<<horizontal<<
+            " ok="<<hasThumb<<" error="<<GetLastError()<<" client="<<spanX(client)<<"x"<<spanY(client)<<
+            " thumb="<<info.xyThumbTop<<","<<info.xyThumbBottom<<" arrows="<<info.dxyLineButton<<
+            " page="<<range.nPage<<" max="<<range.nMax<<std::endl;
+        require(hasThumb&&info.xyThumbBottom>info.xyThumbTop,
+            "native scrollbar exposes a draggable thumb in either orientation");
+        const int middle=horizontal?spanY(client)/2:spanX(client)/2;
+        const auto point=[&](int along){return horizontal?MAKELPARAM(along,middle):MAKELPARAM(middle,along);};
+        const int pagePoint=info.xyThumbBottom+4;
+        SendMessageW(bar,WM_LBUTTONDOWN,MK_LBUTTON,point(pagePoint));
+        SendMessageW(bar,WM_LBUTTONUP,0,point(pagePoint));
+        require(app.scroll_>0&&GetCapture()!=bar,"clicking the scrollbar track advances thumbnails and releases capture");
+        app.scrollCatalog(-app.maxScroll());
+        GetScrollBarInfo(bar,OBJID_CLIENT,&info);
+        const int thumb=(info.xyThumbTop+info.xyThumbBottom)/2;
+        SendMessageW(bar,WM_LBUTTONDOWN,MK_LBUTTON,point(thumb));
+        require(GetCapture()==bar&&app.catalogScrollDragging_,"pressing the native thumb starts scrollbar dragging");
+        const int end=(horizontal?spanX(client):spanY(client))+100;
+        SendMessageW(bar,WM_MOUSEMOVE,MK_LBUTTON,point(end));
+        SendMessageW(bar,WM_LBUTTONUP,0,point(end));
+        require(app.scroll_==app.maxScroll()&&app.scroll_>65535,"dragging the thumb reaches the real end without truncating a large range");
+        range.fMask=SIF_POS;GetScrollInfo(bar,SB_CTL,&range);
+        require(range.nPos==app.scroll_,"scrollbar position stays synchronized with thumbnail scrolling");
+        const auto last=app.itemRect(app.files_.size()-1);
+        const POINT lastCenter{(last.left+last.right)/2,(last.top+last.bottom)/2};
+        require(PtInRect(&viewport,lastCenter)&&app.catalogItemAt(lastCenter)==static_cast<int>(app.files_.size()-1),
+            "the final thumbnail is visible and clickable after dragging to the end");
+        app.files_.resize(1);app.scroll_=0;app.layout();
+        require(app.maxScroll()==0&&!IsWindowVisible(bar),"a catalog that fits hides its scrollbar");
+        app.files_=originalFiles;
+        for(int index=static_cast<int>(app.files_.size());index<10000;++index) {
+            CatalogFile file;file.path=paths.front().parent_path()/(L"synthetic-"+std::to_wstring(index)+L".png");
+            file.name=file.path.filename().wstring();file.extension=L".png";app.files_.push_back(std::move(file));
+        }
+    }
+    app.panel_=Panel::hidden;app.layout();
+    require(!IsWindowVisible(app.catalogScroll_),"hiding the catalog hides its scrollbar");
+    require(app.selectedFiles_==selected&&app.path_==viewed,"scrollbar gestures preserve both checked selection and viewed media");
+    app.files_=originalFiles;app.panel_=originalPanel;app.detail_=originalDetail;app.cards_=originalCards;
+    app.thumb_=originalThumb;app.catalogWidth_=originalWidth;app.catalogHeight_=originalHeight;
+    app.collectionOptions_=originalOptions;app.scroll_=originalScroll;app.layout();
+}
+
+void checkRevealTargetsAndPathRemapping(viewery::App& app,const std::vector<std::filesystem::path>& paths)
+{
+    using namespace viewery;
+    const auto originalPath=app.path_;
+    const auto originalSelected=app.selectedFiles_;
+    const auto originalFiles=app.files_,originalDirectoryFiles=app.directoryFiles_;
+    const auto originalThumbnails=app.thumbnails_;
+    const auto originalRequested=app.requested_;
+    app.selectedFiles_.clear();app.path_=paths[0];
+    require(app.revealTargets()==std::vector<std::filesystem::path>{paths[0]},"catalog reveal targets the viewed file when no checkboxes are selected");
+    app.selectedFiles_={paths[1],paths[3]};
+    require(app.revealTargets()==std::vector<std::filesystem::path>(app.selectedFiles_.begin(),app.selectedFiles_.end()),
+        "catalog reveal targets every checked file while preserving the independent preview");
+    app.path_.clear();app.selectedFiles_.clear();
+    require(app.revealTargets().empty(),"an empty viewer has no Explorer reveal targets");
+
+    const auto bitmap=[] {
+        return Thumbnail(CreateBitmap(1,1,1,32,nullptr),[](HBITMAP value){if(value) DeleteObject(value);});
+    };
+    const auto first=bitmap(),second=bitmap();
+    require(first&&second,"isolated thumbnail cache fixtures are created");
+    app.path_=paths[0];app.selectedFiles_={paths[0],paths[2]};
+    app.thumbnails_={{paths[0],first},{paths[1],second}};app.requested_={paths[0],paths[1]};
+    require(app.applyRenamedPaths({{paths[0],paths[1]},{paths[1],paths[0]}}),"renaming a cycle reports that the viewed file moved");
+    require(app.path_==paths[1]&&app.selectedFiles_==std::set<std::filesystem::path>{paths[1],paths[2]},
+        "cycle remapping resolves preview and checked paths once from their original names");
+    require(app.directoryFiles_[0].path==paths[1]&&app.directoryFiles_[1].path==paths[0]&&
+        app.directoryFiles_[0].name==paths[1].filename().wstring()&&app.directoryFiles_[0].extension==paths[1].extension().wstring(),
+        "cycle remapping updates catalog paths, labels and extensions together");
+    require(app.thumbnails_.at(paths[1])==first&&app.thumbnails_.at(paths[0])==second&&app.requested_.empty(),
+        "cycle remapping preserves each thumbnail identity and clears obsolete requests");
+    app.files_=originalFiles;app.directoryFiles_=originalDirectoryFiles;
+    app.path_=paths[0];app.selectedFiles_={paths[0],paths[1]};app.thumbnails_={{paths[0],first},{paths[1],second}};
+    require(app.applyRenamedPaths({{paths[0],paths[1]},{paths[1],paths[2]}})&&app.path_==paths[1]&&
+        app.selectedFiles_==std::set<std::filesystem::path>{paths[1],paths[2]}&&
+        app.thumbnails_.at(paths[1])==first&&app.thumbnails_.at(paths[2])==second,
+        "chain remapping never applies a second rename to an already mapped path");
+    require(!app.applyRenamedPaths({{paths[9],paths[10]}}),"renaming an unrelated file does not report a preview change");
+    app.path_=originalPath;app.selectedFiles_=originalSelected;app.files_=originalFiles;
+    app.directoryFiles_=originalDirectoryFiles;app.thumbnails_=originalThumbnails;app.requested_=originalRequested;
+    app.updateTitle();
+}
+
 void checkVideoSpace(viewery::App& app, const std::filesystem::path& video)
 {
     using namespace viewery;
@@ -305,6 +432,12 @@ void checkVideoSpace(viewery::App& app, const std::filesystem::path& video)
     app.path_ = video;
     app.mode_ = Mode::full;
     app.layout();
+    auto resume=app.playback_;resume.position=0.5;resume.volume=0;resume.zoom=2;
+    app.resumePlayback_=resume;app.refresh();
+    require(wait([&] {
+        app.refresh();return !app.resumePlayback_&&!app.playback_.seeking&&app.playback_.paused&&
+            std::abs(app.playback_.position-0.5)<0.025&&std::abs(app.playback_.volume)<0.01&&std::abs(app.playback_.zoom-2)<0.01;
+    }),"restoring playback after a library operation preserves position, pause, muted volume and zoom");
     const auto before = app.playback_.position;
     app.key(VK_RIGHT, true);
     require(wait([&] { app.playback_ = app.player_->poll();return app.playback_.paused && app.playback_.position > before + 0.02; }),
@@ -443,6 +576,8 @@ int wmain(int argc, wchar_t** argv)
             const auto settingsButton = app.buttons_[static_cast<UINT>(Control::settings) - static_cast<UINT>(Control::open)];
             require(IsWindowVisible(checkboxButton) && IsWindowVisible(artistButton) && IsWindowVisible(settingsButton),
                 "catalog has dedicated checkbox and artist controls and toolbar has Settings");
+            const auto revealButton=app.buttons_[static_cast<UINT>(Control::catalogReveal)-static_cast<UINT>(Control::open)];
+            require(IsWindowVisible(revealButton)&&IsWindowEnabled(revealButton),"catalog provides an enabled compact Explorer reveal button for the current selection");
             const bool previousSelectionMode = app.selectMode_;
             app.command(static_cast<UINT>(Control::catalogSelect));
             require(app.selectMode_ != previousSelectionMode, "catalog checkbox button toggles selection mode directly");
@@ -533,6 +668,8 @@ int wmain(int argc, wchar_t** argv)
             app.openStudio();
             require(wait([&] { return !app.studio_->busy(); }), "Studio is idle before layout repaint regression checks");
             checkStableLayout(app);
+            checkRevealTargetsAndPathRemapping(app,paths);
+            checkCatalogScrollbar(app,paths);
             checkCanvasGestures(app);
             checkResizablePanels(app);
             checkQuickImageSpace(app);

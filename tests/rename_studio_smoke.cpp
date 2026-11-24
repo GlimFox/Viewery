@@ -23,6 +23,7 @@ constexpr int closeStudio=1051;
 constexpr int advancedOptions=1052;
 constexpr int liveExample=1054;
 unsigned closeRequests=0;
+unsigned collectionNotifications=0;
 
 HWND control(HWND pane,int id) {
     struct Search {int id;HWND found=nullptr;} search{id};
@@ -39,6 +40,7 @@ HWND control(HWND pane,int id) {
 }
 
 LRESULT CALLBACK hostProcedure(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
+    if(message==changed) {++collectionNotifications;return 0;}
     if(message==WM_COMMAND&&LOWORD(wparam)==closeStudio) {
         ++closeRequests;
         if(const HWND pane=FindWindowExW(window,nullptr,L"Viewery.RenameStudio.1",nullptr)) ShowWindow(pane,SW_HIDE);
@@ -370,6 +372,112 @@ void checkOwnedEditor(RenameStudio& studio,const fs::path& folder) {
     require(!IsWindowVisible(host)&&IsWindowVisible(studio.window()),"Closing templates leaves the main rename panel open");
 }
 
+void checkArtistRegistryRefresh(HWND host,HFONT font,const fs::path& folder) {
+    const auto database=folder/L"registry-refresh.sqlite3";
+    CollectionStore registry(database);
+    Artist artist;artist.name=L"Художник Один";artist.fileName=L"artist-tag";artist.aliases=L"Fox; Лис";
+    artist.id=registry.saveArtist(artist);
+    Artist removed;removed.name=L"To Delete";removed.fileName=L"delete-tag";removed.aliases=L"Gone";
+    removed.id=registry.saveArtist(removed);
+    RenameStudio studio(host,changed,[]{},database);
+    RECT area{};GetClientRect(host,&area);studio.show(area,96,font);
+    studio.refreshCollection();
+    require(studio.busy()&&wait([&]{return !studio.busy();}),"Registry-only refresh runs asynchronously before any files are indexed");
+    const auto pane=studio.window(),choice=control(pane,1006);
+    const auto row=SendMessageW(choice,CB_FINDSTRINGEXACT,static_cast<WPARAM>(-1),reinterpret_cast<LPARAM>(artist.name.c_str()));
+    require(studio.snapshot().files.empty()&&SendMessageW(choice,CB_GETCOUNT,0,0)==2&&row>=0,
+        "All predefined artists are available even when they have no files");
+    SendMessageW(choice,CB_SETCURSEL,row,0);notify(pane,1006,CBN_SELCHANGE);
+    require(text(choice)==artist.name,"A predefined artist can be selected from the native data combo");
+    const auto oldRemoved=removed;removed.name=L"Renamed Empty Artist";
+    const auto metadataRename=registry.renameArtist(oldRemoved,removed,{});
+    require(metadataRename.success&&metadataRename.changes.empty(),"An artist with no media gets a durable metadata-only rename operation");
+    studio.refreshCollection();require(wait([&]{return !studio.busy();}),"Registry refresh reloads a metadata-only artist operation");
+    click(pane,1003);
+    require(ListView_GetItemCount(control(pane,1043))==1&&cell(control(pane,1043),0,2)==L"0"&&registry.history().front().canUndo,
+        "Studio history exposes Undo for an artist rename without requiring another file index");
+    click(pane,1000);
+
+    const auto source=folder/L"registry-original.png";
+    {std::ofstream output(source,std::ios::binary);output<<"registry bytes";}
+    studio.setFiles({source},{source});require(wait([&]{return !studio.busy();}),"Registry test source is indexed in the isolated database");
+    const auto originalBytes=studio.snapshot().files.front().bytes;
+    const auto editorPane=templatePane(studio);
+    SendMessageW(control(editorPane,1021),LB_SETCURSEL,0,0);notify(editorPane,1021,LBN_SELCHANGE);
+    SetWindowTextW(control(editorPane,1029),L"R-");click(editorPane,1033);click(editorPane,1041);pump();
+    SetWindowTextW(choice,L"aRtIsT-TaG; fOX; лИС");notify(pane,1006,CBN_EDITCHANGE);
+    const auto draft=text(control(pane,liveExample));click(pane,1041);
+    require(wait([&]{return !studio.busy()&&studio.queuedFileCount()==1;}),"Filename tokens and Unicode aliases can prepare a batch using an existing artist");
+    const auto frozen=queueNames(pane);
+    require(studio.snapshot().artists.size()==2&&studio.snapshot().artworks.front().artists==std::vector<LibraryId>{artist.id}&&
+        frozen.front().second==draft&&frozen.front().second.find(L"R-artist-tag_")==0,
+        "Case-insensitive aliases share one artist ID and the live example keeps canonical filename spelling");
+
+    SetWindowTextW(choice,L"Fox; Gone; Unrelated Draft");
+    artist.name=L"Переименованный Художник";artist.fileName=L"new-tag";artist.aliases=L"New Alias";
+    registry.saveArtist(artist);registry.deleteArtist(removed.id);
+    {std::ofstream output(source,std::ios::binary|std::ios::trunc);output<<"physical file changed without a reindex request";}
+    const auto notifications=collectionNotifications;
+    studio.refreshCollection();studio.refreshCollection();studio.refreshCollection();
+    require(wait([&]{return !studio.busy();}),"Repeated refresh requests coalesce while an asynchronous registry refresh runs");pump();
+    require(collectionNotifications==notifications+2,"A busy refresh keeps only one pending reload");
+    require(text(choice)==artist.name+L"; Unrelated Draft"&&SendMessageW(choice,CB_GETCOUNT,0,0)==1&&
+        SendMessageW(choice,CB_FINDSTRINGEXACT,static_cast<WPARAM>(-1),reinterpret_cast<LPARAM>(artist.name.c_str()))>=0,
+        "Registry rename follows the same ID, deletion removes its old alias, and an unrelated typed draft survives");
+    require(studio.snapshot().files.front().bytes==originalBytes&&queueNames(pane)==frozen,
+        "Registry refresh does not reindex media or alter approved queue names");
+    require(text(control(editorPane,1029))==L"R-","Registry refresh preserves the currently edited template");
+
+    SetWindowTextW(choice,L"New Alias");artist.aliases=L"Replacement Alias";registry.saveArtist(artist);
+    studio.refreshCollection();require(wait([&]{return !studio.busy();})&&text(choice)==artist.name,
+        "Removing an alias keeps its typed token attached to the existing artist ID");
+
+    SetWindowTextW(choice,L"replacement alias; ПЕРЕИМЕНОВАННЫЙ ХУДОЖНИК");click(pane,1041);
+    require(studio.busy(),"A new batch starts after registry reconciliation");
+    studio.refreshCollection();studio.refreshCollection();
+    require(wait([&]{return !studio.busy()&&studio.queuedFileCount()==1;}),"A refresh requested during batch preparation runs after the job without losing its queue");
+    require(studio.snapshot().artists.size()==1&&queueNames(pane).front().second.find(L"R-new-tag_")==0,
+        "The renamed registry artist is reused without recreating a deleted or duplicate artist");
+    registry.deleteArtist(artist.id);studio.refreshCollection();
+    require(wait([&]{return !studio.busy();})&&text(choice).empty()&&SendMessageW(choice,CB_GETCOUNT,0,0)==0,
+        "Deleting the remaining artist clears every bound semicolon token");
+    const auto approved=queueNames(pane);click(pane,1041);
+    require(wait([&]{return !studio.busy();})&&studio.snapshot().artists.empty()&&approved.size()==1,
+        "Adding another batch after deletion does not silently recreate the deleted artist");
+    studio.hide();
+}
+
+void checkQueuedCycleUndo(HWND host,HFONT font,const fs::path& folder) {
+    const auto first=folder/L"cycle-first.png",second=folder/L"cycle-second.png";
+    {std::ofstream output(first,std::ios::binary);output<<"first cycle bytes";}
+    {std::ofstream output(second,std::ios::binary);output<<"second cycle bytes";}
+    const auto database=folder/L"cycle-queue.sqlite3";
+    CollectionStore registry(database);
+    const auto files=registry.indexFiles({first,second});
+    const auto renamed=registry.rename({{files[0].id,first,second.filename().wstring(),true},
+        {files[1].id,second,first.filename().wstring(),true}});
+    require(renamed.success,"An isolated two-file rename cycle is committed before preparing another batch");
+    RenameStudio studio(host,changed,[]{},database);
+    RECT area{};GetClientRect(host,&area);studio.show(area,96,font);studio.setFiles({first,second},{first,second});
+    require(wait([&]{return !studio.busy();}),"Studio loads both post-cycle identities");
+    const auto pane=studio.window();SetWindowTextW(control(pane,1006),L"Cycle Artist");click(pane,1041);
+    require(wait([&]{return !studio.busy()&&studio.queuedFileCount()==2;}),"Both post-cycle files can be frozen in a pending batch");
+    const auto before=queueNames(pane);click(pane,1003);
+    ListView_SetItemState(control(pane,1043),0,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);pump();
+    require(wait([&]{return !studio.busy();}),"Cycle operation history can be inspected while a batch stays queued");
+    {auto confirm=confirmOwnDialog(GetCurrentThreadId());click(pane,1044);}
+    require(wait([&]{return !studio.busy();}),"Undo restores the two original file identities");
+    const auto after=queueNames(pane);
+    require(after.size()==before.size()&&std::ranges::all_of(after,[&](const auto& entry) {
+        const auto old=std::ranges::find(before,entry.second,&std::pair<std::wstring,std::wstring>::second);
+        return old!=before.end()&&entry.first!=old->first&&
+            (entry.first==first.filename().wstring()||entry.first==second.filename().wstring());
+    }),"Queued cycle sources remap once while each approved target name stays frozen");
+    require(content(first)=="first cycle bytes"&&content(second)=="second cycle bytes",
+        "Cycle Undo keeps every file's original bytes with its remapped queued source");
+    studio.hide();
+}
+
 int wmain(int argc,wchar_t** argv) {
     if(argc!=2) return 2;
     const fs::path folder=fs::absolute(argv[1])/(L"run-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
@@ -393,6 +501,8 @@ int wmain(int argc,wchar_t** argv) {
         require(host!=nullptr,"Private desktop host window is created");
         font=CreateFontW(-14,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,0,L"Segoe UI");
+        checkArtistRegistryRefresh(host,font,folder);
+        checkQueuedCycleUndo(host,font,folder);
         const auto one=folder/L"first/imageA01.png",two=folder/L"first/imageA02.png",keep=folder/L"first/keep.png";
         const auto three=folder/L"second/imageB01.png",four=folder/L"second/imageB02.png";
         {std::ofstream f(one,std::ios::binary);f<<"first bytes";}{std::ofstream f(two,std::ios::binary);f<<"second bytes";}

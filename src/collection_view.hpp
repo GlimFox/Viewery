@@ -25,6 +25,9 @@ struct CollectionViewOptions {
     CollectionSort sort = CollectionSort::name;
     CollectionGroup group = CollectionGroup::none;
     bool descending = false;
+    // Filename mode intentionally ignores stored artist links when the current
+    // name no longer contains that artist. Metadata itself remains unchanged.
+    bool filenameArtists = false;
     std::set<std::wstring> collapsed;
 };
 

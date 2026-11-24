@@ -74,6 +74,49 @@ std::vector<std::wstring> split(std::wstring_view value,wchar_t delimiter) {
     while(std::getline(input,part,delimiter)) if(auto clean=trim(part);!clean.empty()) parts.push_back(std::move(clean));
     return parts;
 }
+bool sameName(std::wstring_view first,std::wstring_view second) {
+    return CompareStringOrdinal(first.data(),static_cast<int>(first.size()),
+        second.data(),static_cast<int>(second.size()),TRUE)==CSTR_EQUAL;
+}
+const Artist* namedArtist(const std::vector<Artist>& artists,std::wstring_view token) {
+    const auto unique=[&](auto matches) {
+        const Artist* result=nullptr;
+        for(const auto& entry:artists) if(matches(entry)) {
+            if(result&&result->id!=entry.id) throw LibraryError("Artist name or alias is ambiguous. Choose a name from the list.");
+            result=&entry;
+        }
+        return result;
+    };
+    if(const auto found=unique([&](const Artist& entry){return sameName(entry.name,token);})) return found;
+    if(const auto found=unique([&](const Artist& entry){return sameName(entry.fileName,token);})) return found;
+    return unique([&](const Artist& entry) {
+        auto aliasesValue=entry.aliases;
+        std::ranges::replace_if(aliasesValue,[](wchar_t ch){return ch==L','||ch==L'\r'||ch==L'\n';},L';');
+        const auto names=split(aliasesValue,L';');
+        return std::ranges::any_of(names,[&](const auto& name){return sameName(name,token);});
+    });
+}
+std::wstring refreshedArtistInput(std::wstring_view value,const std::vector<Artist>& previous,
+                                const std::vector<Artist>& current) {
+    auto names=split(value,L';');
+    bool changed=false;
+    for(auto& name:names) {
+        const Artist* old=nullptr;
+        try {old=namedArtist(previous,name);} catch(const LibraryError&) {continue;}
+        if(!old) continue;
+        const auto found=std::ranges::find(current,old->id,&Artist::id);
+        if(found==current.end()) {name.clear();changed=true;}
+        else {
+            const Artist* stillBound=nullptr;
+            try {stillBound=namedArtist(current,name);} catch(const LibraryError&) {}
+            if(found->name!=old->name||!stillBound||stillBound->id!=old->id) {name=found->name;changed=true;}
+        }
+    }
+    if(!changed) return std::wstring(value);
+    std::wstring result;
+    for(const auto& name:names) if(!name.empty()) {if(!result.empty()) result+=L"; ";result+=name;}
+    return result;
+}
 Metadata parseFields(const std::wstring& value) {
     Metadata result;
     for(const auto& entry:split(value,L'\n')) {
@@ -122,7 +165,7 @@ struct RenameStudio::Impl {
     std::vector<HWND> labels;
     int tab=0,dragBlock=-1,scrollOffset=0,scrollLimit=0,contentHeight=0;
     POINT dragOrigin{};
-    bool filling=false,indexPending=false,layingOut=false,dragging=false,advanced=false;
+    bool filling=false,indexPending=false,refreshPending=false,layingOut=false,dragging=false,advanced=false;
     bool templateOnly=false,dataExpanded=false;
     int deferredUiAction=0;
     bool deferredUiPosted=false;
@@ -346,6 +389,7 @@ struct RenameStudio::Impl {
             self->layout();
             PostMessageW(self->owner,self->changed,0,0);
             if(self->indexPending&&!self->busy()) self->beginIndex();
+            if(self->refreshPending&&!self->busy()) self->beginRefresh();
             self->scheduleDeferredUi();
             return 0;
         }
@@ -590,26 +634,34 @@ struct RenameStudio::Impl {
         std::optional<std::wstring> operationDetails;
         std::optional<std::pair<std::uint64_t,std::uint64_t>> previewGeneration;
         bool replaceQueue=false,clearQueue=false,batchAdded=false;
+        bool snapshotOnly=false,snapshotLoaded=false;
     } pending;
-    bool startJob(std::function<void(CollectionStore&,std::stop_token)> task,std::wstring message) {
+    bool startJob(std::function<void(CollectionStore&,std::stop_token)> task,std::wstring message,bool snapshotOnly=false) {
         if(busy()) return false;
         SetWindowTextW(c(status),message.c_str());
         pending={};
+        pending.snapshotOnly=snapshotOnly;
         worker=std::jthread([this,task=std::move(task)](std::stop_token stop) {
             try {
                 if(!store) store=std::make_shared<CollectionStore>(database.empty()?defaultDatabasePath():database);
                 task(*store,stop);
                 pending.snapshot=store->snapshot();
-                pending.presets=store->presets();
+                pending.snapshotLoaded=true;
                 pending.history=store->history();
+                if(!pending.snapshotOnly) {
+                    pending.presets=store->presets();
+                }
                 if(pending.message.empty()) pending.message=L"Готово";
             } catch(const std::exception& e) {
                 pending.message=wide(e.what());
                 if(store) {
                     try {
                         pending.snapshot=store->snapshot();
-                        pending.presets=store->presets();
+                        pending.snapshotLoaded=true;
                         pending.history=store->history();
+                        if(!pending.snapshotOnly) {
+                            pending.presets=store->presets();
+                        }
                     } catch(...) {}
                 }
             }
@@ -617,6 +669,19 @@ struct RenameStudio::Impl {
         });
         layout();
         return true;
+    }
+    void beginRefresh() {
+        if(templateParent) {templateParent->beginRefresh();return;}
+        if(busy()) {refreshPending=true;return;}
+        refreshPending=false;
+        startJob([](CollectionStore&,std::stop_token) {},L"Обновление художников…",true);
+    }
+    void replaceSnapshot(CollectionSnapshot snapshot) {
+        const auto value=refreshedArtistInput(text(c(artist)),data.artists,snapshot.artists);
+        const bool wasFilling=std::exchange(filling,true);
+        SetWindowTextW(c(artist),value.c_str());
+        filling=wasFilling;
+        data=std::move(snapshot);
     }
     void beginIndex() {
         if(busy()) { indexPending=true;return; }
@@ -636,8 +701,10 @@ struct RenameStudio::Impl {
     void finishJob() {
         const bool cancelled=worker.get_stop_token().stop_requested();
         worker.join();
-        data=std::move(pending.snapshot);
-        presets=std::move(pending.presets);
+        if(pending.snapshotLoaded) replaceSnapshot(std::move(pending.snapshot));
+        if(!pending.snapshotOnly) {
+            presets=std::move(pending.presets);
+        }
         operations=std::move(pending.history);
         if(pending.replaceQueue||(pending.previewGeneration&&pending.previewGeneration->first==selectionGeneration&&
             pending.previewGeneration->second==directoryGeneration)) preview=std::move(pending.preview);
@@ -652,22 +719,28 @@ struct RenameStudio::Impl {
         if(pending.files) {
             if(!pending.clearQueue&&pending.files->success) {
                 for(auto& row:preview) for(const auto& [source,target]:pending.files->changes) {
-                    if(CompareStringOrdinal(row.proposal.source.c_str(),-1,source.c_str(),-1,TRUE)==CSTR_EQUAL) row.proposal.source=target;
+                    if(CompareStringOrdinal(row.proposal.source.c_str(),-1,source.c_str(),-1,TRUE)==CSTR_EQUAL) {
+                        row.proposal.source=target;break;
+                    }
                 }
             }
             fileResult=std::move(pending.files);
         }
         SetWindowTextW(c(status),pending.message.c_str());
         fillMetadata();
-        fillPresets();
-        fillPreview();
+        if(!pending.snapshotOnly) {fillPresets();fillPreview();}
         fillHistory();
         updateSummary();updateExample();
         if(templateParent) templateParent->syncTemplateFromEditor();
-        if(editor&&!editor->busy()) {editor->data=data;editor->presets=presets;editor->selection=selection;editor->fillMetadata();editor->fillPresets();editor->updateExample();}
+        if(editor&&!editor->busy()) {
+            editor->replaceSnapshot(data);editor->presets=presets;editor->selection=selection;editor->fillMetadata();
+            if(!pending.snapshotOnly) editor->fillPresets();
+            editor->updateExample();
+        }
         PostMessageW(owner,changed,0,0);
         layout();
         if((!cancelled||deferredUiAction)&&(indexPending||directory!=indexed)) beginIndex();
+        if(refreshPending&&!busy()) beginRefresh();
         scheduleDeferredUi();
     }
     void updateSelection(std::vector<fs::path> selected) {
@@ -791,8 +864,10 @@ struct RenameStudio::Impl {
                     const auto names=split(text(c(artist)),L';');
                     std::vector<LibraryId> authors;
                     for(std::size_t i=0;i<names.size();++i) {
-                        const auto found=std::ranges::find(snapshot.artists,names[i],&Artist::name);
-                        if(found!=snapshot.artists.end()) authors.push_back(found->id);
+                        const auto found=namedArtist(snapshot.artists,names[i]);
+                        if(found) {
+                            if(std::ranges::find(authors,found->id)==authors.end()) authors.push_back(found->id);
+                        }
                         else {
                             Artist draft;draft.id=L"viewery-draft-artist-"+std::to_wstring(i);draft.name=names[i];draft.fileName=names[i];
                             authors.push_back(draft.id);snapshot.artists.push_back(std::move(draft));
@@ -863,20 +938,26 @@ struct RenameStudio::Impl {
         value.counterScope=static_cast<CounterScope>(std::max<LRESULT>(0,SendMessageW(c(counterScope),CB_GETCURSEL,0,0)));
         std::vector<RenameProposal> existingQueue;
         for(const auto& row:preview) existingQueue.push_back(row.proposal);
-        startJob([this,selected,names,extra,titleValue,alias,mode,chosenId,firstNumber,firstVersion,addToQueue,value,existingQueue]
+        const auto knownArtists=data.artists;
+        startJob([this,selected,names,extra,titleValue,alias,mode,chosenId,firstNumber,firstVersion,addToQueue,value,existingQueue,knownArtists]
                  (CollectionStore& db,std::stop_token stop) {
             auto current=db.snapshot();
             std::vector<LibraryId> artists;
-            std::set<std::wstring> savedNames;
+            std::set<LibraryId> savedArtists;
             for(const auto& name:names) {
-                if(!savedNames.insert(name).second) continue;
-                auto found=std::ranges::find(current.artists,name,&Artist::name);
+                const auto bound=namedArtist(knownArtists,name);
+                const auto byId=bound?std::ranges::find(current.artists,bound->id,&Artist::id):current.artists.end();
+                if(bound&&byId==current.artists.end()) continue;
+                const auto found=bound?&*byId:namedArtist(current.artists,name);
                 Artist a;
-                if(found!=current.artists.end()) a=*found;
-                a.name=name;if(a.fileName.empty()) a.fileName=name;
+                if(found) a=*found;
+                else {a.name=name;a.fileName=name;}
+                if(!a.id.empty()&&savedArtists.contains(a.id)) continue;
                 if(names.size()==1&&!alias.empty()) a.aliases=alias;
-                const auto id=db.saveArtist(a);
+                const auto id=found&&(names.size()!=1||alias.empty()||alias==found->aliases)?a.id:db.saveArtist(a);
+                savedArtists.insert(id);
                 artists.push_back(id);
+                if(!found) {a.id=id;current.artists.push_back(std::move(a));}
             }
             LibraryId common=chosenId;
             if(mode==2&&common.empty()) throw LibraryError("Choose an existing artwork");
@@ -1483,6 +1564,7 @@ void RenameStudio::setFiles(std::vector<fs::path> directory,std::vector<fs::path
     if(selected!=impl_->selection) impl_->updateSelection(std::move(selected));
     if(changed||(!impl_->busy()&&!impl_->store)) impl_->beginIndex();
 }
+void RenameStudio::refreshCollection() {impl_->beginRefresh();}
 const CollectionSnapshot& RenameStudio::snapshot() const {return impl_->data;}
 std::optional<RenameResult> RenameStudio::takeFileChanges() {return std::exchange(impl_->fileResult,std::nullopt);}
 }

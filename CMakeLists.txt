@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 project(Viewery VERSION 0.2.0 LANGUAGES CXX)
-set(VIEWERY_VERSION "0.2.0-beta.3" CACHE STRING "Semantic version published by Viewery")
+set(VIEWERY_VERSION "0.2.0-beta.4" CACHE STRING "Semantic version published by Viewery")
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR NOT MSVC)
     message(FATAL_ERROR "Viewery requires Windows x64 and the Microsoft C++ toolchain.")
 endif()
@@ -25,7 +25,8 @@ endfunction()
 
 add_executable(Viewery WIN32 src/main.cpp src/catalog.cpp src/media.cpp src/explorer.cpp
     src/converter.cpp src/frame_image.cpp src/library.cpp src/rename_template.cpp src/rename_studio.cpp
-    src/updater.cpp src/runtime_paths.cpp src/collection_view.cpp src/settings_window.cpp src/Viewery.rc)
+    src/updater.cpp src/runtime_paths.cpp src/collection_view.cpp src/settings_window.cpp
+    src/artist_registry.cpp src/shell_selection.cpp src/Viewery.rc)
 set_source_files_properties(src/Viewery.rc PROPERTIES
     OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/Viewery.manifest;${CMAKE_CURRENT_SOURCE_DIR}/src/Viewery.ico")
 viewery_target(Viewery)
@@ -64,6 +65,10 @@ if(BUILD_TESTING)
     add_executable(viewery-quick-space-tests tests/quick_space_smoke.cpp)
     viewery_target(viewery-quick-space-tests)
     add_test(NAME quick-space-gesture COMMAND viewery-quick-space-tests)
+    add_executable(viewery-shell-selection-tests tests/shell_selection_smoke.cpp src/shell_selection.cpp)
+    viewery_target(viewery-shell-selection-tests)
+    target_link_libraries(viewery-shell-selection-tests PRIVATE shell32 ole32)
+    add_test(NAME explorer-selection-plan COMMAND viewery-shell-selection-tests)
 endif()
 option(VIEWERY_MEDIA_TESTS "Enable integration tests with local libmpv and FFmpeg binaries" OFF)
 if(BUILD_TESTING AND VIEWERY_MEDIA_TESTS)
@@ -97,6 +102,15 @@ if(BUILD_TESTING AND VIEWERY_GUI_TESTS)
     add_test(NAME rename-studio-gui COMMAND viewery-rename-studio-tests
         "${CMAKE_BINARY_DIR}/studio-gui-test-data")
     set_tests_properties(rename-studio-gui PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    add_executable(viewery-artist-registry-tests tests/artist_registry_smoke.cpp
+        src/artist_registry.cpp src/library.cpp src/frame_image.cpp src/Viewery.rc)
+    viewery_target(viewery-artist-registry-tests)
+    target_link_options(viewery-artist-registry-tests PRIVATE /MANIFEST:NO)
+    target_link_libraries(viewery-artist-registry-tests PRIVATE
+        comctl32 dwmapi uxtheme user32 gdi32 ole32 shell32 windowscodecs bcrypt)
+    add_test(NAME artist-registry-gui COMMAND viewery-artist-registry-tests
+        "${CMAKE_BINARY_DIR}/artist-registry-test-data")
+    set_tests_properties(artist-registry-gui PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 endif()
 
 if(BUILD_TESTING AND VIEWERY_GUI_TESTS)
@@ -117,7 +131,8 @@ if(BUILD_TESTING AND VIEWERY_GUI_TESTS)
     add_executable(viewery-main-ui-tests tests/main_ui_smoke.cpp
         src/catalog.cpp src/media.cpp src/explorer.cpp src/converter.cpp src/frame_image.cpp
         src/library.cpp src/rename_template.cpp src/rename_studio.cpp src/updater.cpp
-        src/runtime_paths.cpp src/collection_view.cpp src/settings_window.cpp src/Viewery.rc)
+        src/runtime_paths.cpp src/collection_view.cpp src/settings_window.cpp
+        src/artist_registry.cpp src/shell_selection.cpp src/Viewery.rc)
     viewery_target(viewery-main-ui-tests)
     target_include_directories(viewery-main-ui-tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_link_options(viewery-main-ui-tests PRIVATE /MANIFEST:NO)

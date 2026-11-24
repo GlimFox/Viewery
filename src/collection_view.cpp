@@ -7,6 +7,7 @@
 #include <cwchar>
 #include <map>
 #include <cwctype>
+#include <memory>
 #include <set>
 #include <string_view>
 #include <utility>
@@ -57,7 +58,7 @@ struct Item {
     const Artwork* work = nullptr;
     const MediaVersion* version = nullptr;
     std::vector<const Artist*> artists;
-    std::vector<Artist> inferredArtists;
+    std::vector<std::shared_ptr<Artist>> inferredArtists;
     std::filesystem::path path;
     std::wstring name, extension, title, authorNames;
     std::size_t ordinal = 0;
@@ -81,8 +82,21 @@ std::wstring artistFromName(const std::filesystem::path& path)
     }
     if(name.empty()) {
         for(std::size_t at=1;at+1<stem.size();++at) {
-            if((stem[at]==L'_'||stem[at]==L'-')&&iswdigit(stem[at+1])) {
+            if(stem[at]!=L'_'&&stem[at]!=L'-') continue;
+            auto end=at+1;
+            while(end<stem.size()&&stem[end]>=L'0'&&stem[end]<=L'9') ++end;
+            const auto digits=end-at-1;
+            if(stem[at]==L'_'&&digits>=1&&digits<=9&&end+1<stem.size()&&stem[end]==L'_') {
                 name=stem.substr(0,at);break;
+            }
+            // Social-export names have two long numeric IDs. A random hash
+            // ending in "-7" is not evidence of an artist.
+            if(stem[at]==L'-'&&digits>=6&&end+1<stem.size()&&stem[end]==L'-') {
+                auto second=end+1;
+                while(second<stem.size()&&stem[second]>=L'0'&&stem[second]<=L'9') ++second;
+                if(second-end-1>=6&&(second==stem.size()||stem[second]==L'_'||stem[second]==L'-')) {
+                    name=stem.substr(0,at);break;
+                }
             }
         }
     }
@@ -101,6 +115,105 @@ std::wstring artistFromName(const std::filesystem::path& path)
     for(const auto& prefix:generic) if(key.starts_with(prefix)&&key.size()>prefix.size()&&
         std::ranges::all_of(std::wstring_view(key).substr(prefix.size()),[](wchar_t ch){return ch>=L'0'&&ch<=L'9';})) return {};
     return name;
+}
+
+bool artistBoundary(wchar_t character)
+{
+    return std::wstring_view(L" _-&+[]()\t").find(character)!=std::wstring_view::npos;
+}
+
+struct ArtistNames {
+    std::map<std::wstring,const Artist*> tokens;
+    std::set<std::wstring> canonical;
+
+    void add(std::wstring name,const Artist& artist,bool primary)
+    {
+        const auto token=folded(trimName(std::move(name)));
+        if(token.empty()) return;
+        if(!primary&&canonical.contains(token)) return;
+        const auto [entry,inserted]=tokens.emplace(token,&artist);
+        if(!inserted&&(!entry->second||entry->second->id!=artist.id)) entry->second=nullptr;
+        if(primary) canonical.insert(token);
+    }
+
+    explicit ArtistNames(const std::vector<Artist>& artists)
+    {
+        for(const auto& artist:artists) {add(artist.name,artist,true);add(artist.fileName,artist,true);}
+        for(const auto& artist:artists) {
+            std::size_t start=0;
+            do {
+                const auto end=artist.aliases.find_first_of(L",;\r\n",start);
+                add(artist.aliases.substr(start,end==std::wstring::npos?end:end-start),artist,false);
+                if(end==std::wstring::npos) break;
+                start=end+1;
+            } while(start<artist.aliases.size());
+        }
+    }
+
+    const Artist* exact(std::wstring_view name) const
+    {
+        const auto entry=tokens.find(folded(name));
+        return entry==tokens.end()?nullptr:entry->second;
+    }
+
+    std::vector<const Artist*> matching(std::wstring_view name) const
+    {
+        const auto haystack=folded(name);
+        std::vector<const Artist*> found;
+        std::set<LibraryId> ids;
+        for(std::size_t start=0;start<haystack.size();++start) {
+            if(start!=0&&!artistBoundary(haystack[start-1])) continue;
+            for(std::size_t end=haystack.size();end>start;--end) {
+                if(end!=haystack.size()&&!artistBoundary(haystack[end])) continue;
+                const auto entry=tokens.find(haystack.substr(start,end-start));
+                if(entry==tokens.end()||!entry->second) continue;
+                if(ids.insert(entry->second->id).second) found.push_back(entry->second);
+                start=end-1;
+                break;
+            }
+        }
+        return found;
+    }
+};
+
+void filenameArtists(Item& item,const ArtistNames& names)
+{
+    std::set<LibraryId> ids;
+    const auto add=[&](const Artist* artist) {
+        if(!artist||!ids.insert(artist->id).second) return;
+        item.artists.push_back(artist);
+        if(!item.authorNames.empty()) item.authorNames+=L" & ";
+        item.authorNames+=artist->name;
+    };
+    const auto prefix=artistFromName(item.path);
+    if(prefix.empty()) {
+        for(const auto* artist:names.matching(item.path.stem().wstring())) add(artist);
+        return;
+    }
+    if(const auto* artist=names.exact(prefix)) {add(artist);return;}
+    if(names.matching(prefix).empty()) {
+        const auto anywhere=names.matching(item.path.stem().wstring());
+        if(!anywhere.empty()) {for(const auto* artist:anywhere) add(artist);return;}
+    }
+    std::size_t start=0;
+    do {
+        const auto end=prefix.find_first_of(L"&+",start);
+        const auto author=trimName(prefix.substr(start,end==std::wstring::npos?end:end-start));
+        if(!author.empty()) {
+            if(const auto* artist=names.exact(author)) add(artist);
+            else {
+                const auto known=names.matching(author);
+                if(!known.empty()) for(const auto* registered:known) add(registered);
+                else {
+                    auto inferred=std::make_shared<Artist>();
+                    inferred->id=L"filename:"+folded(author);inferred->name=author;
+                    add(inferred.get());item.inferredArtists.push_back(std::move(inferred));
+                }
+            }
+        }
+        if(end==std::wstring::npos) break;
+        start=end+1;
+    } while(start<prefix.size());
 }
 
 std::int64_t customOrder(const MediaRecord* file, std::size_t ordinal)
@@ -180,12 +293,8 @@ std::vector<Item> matchingItems(const CollectionSnapshot& collection,
     const auto artists = recordIndex(collection.artists);
     const auto works = recordIndex(collection.artworks);
     const auto versions = recordIndex(collection.versions);
-    std::map<std::wstring,const Artist*> artistNames;
-    for(const auto& artist:collection.artists) {
-        artistNames.emplace(folded(artist.name),&artist);
-        if(!artist.fileName.empty()) artistNames.emplace(folded(artist.fileName),&artist);
-    }
-    const bool inferNames=options.group==CollectionGroup::artist||options.sort==CollectionSort::artist||!options.filter.artist.empty();
+    const ArtistNames artistNames(collection.artists);
+    const bool inferNames=options.filenameArtists||options.group==CollectionGroup::artist||options.sort==CollectionSort::artist||!options.filter.artist.empty();
     auto filter = options.filter;
     filter.text = folded(filter.text);
     filter.artist = folded(filter.artist);
@@ -220,32 +329,9 @@ std::vector<Item> matchingItems(const CollectionSnapshot& collection,
                 item.title = displayedTitle(item.work);
             }
         }
+        if(options.filenameArtists) {item.artists.clear();item.authorNames.clear();}
         if(inferNames&&item.artists.empty()) {
-            auto name=artistFromName(item.path);
-            if(name.empty()) {
-                auto stem=item.path.stem().wstring();
-                if(const auto suffix=stem.find(L'(');suffix!=std::wstring::npos) stem=trimName(stem.substr(0,suffix));
-                if(const auto known=artistNames.find(folded(stem));known!=artistNames.end()) name=known->second->name;
-            }
-            if(!name.empty()) {
-                std::size_t start=0;
-                do {
-                    const auto end=name.find(L'&',start);
-                    auto author=trimName(name.substr(start,end==std::wstring::npos?end:end-start));
-                    if(!author.empty()) {
-                        const auto known=artistNames.find(folded(author));
-                        if(known!=artistNames.end()) item.inferredArtists.push_back(*known->second);
-                        else {Artist inferred;inferred.id=L"filename:"+folded(author);inferred.name=std::move(author);item.inferredArtists.push_back(std::move(inferred));}
-                    }
-                    if(end==std::wstring::npos) break;
-                    start=end+1;
-                } while(start<name.size());
-                for(const auto& author:item.inferredArtists) {
-                    item.artists.push_back(&author);
-                    if(!item.authorNames.empty()) item.authorNames+=L" & ";
-                    item.authorNames+=author.name;
-                }
-            }
+            filenameArtists(item,artistNames);
         }
         item.order = customOrder(item.file, ordinal);
         if (matches(item, filter)) result.push_back(std::move(item));
@@ -454,12 +540,13 @@ void appendArtistGroups(CollectionViewResult& view, const std::vector<const Item
     for (const auto& artist : ordered) {
         const auto key = branch(L"", L"artist", artist.id);
         const auto total = counts(artist.files);
-        const auto label=artist.label+L" — "+(total.works?std::to_wstring(total.works)+L" работ · ":std::wstring{})+
+        const bool showWorks=total.works&&!(options.filenameArtists&&artist.id.empty());
+        const auto label=artist.label+L" — "+(showWorks?std::to_wstring(total.works)+L" работ · ":std::wstring{})+
             std::to_wstring(total.files)+L" файлов";
         const bool expanded=appendGroup(view,key,label,artist.files,{},options);
         view.rows.back().artistName=artist.label;
         if(expanded) {
-            if(total.works) appendWorkGroups(view,artist.files,{key},options);
+            if(showWorks) appendWorkGroups(view,artist.files,{key},options);
             else appendFiles(view,artist.files,{key});
         }
     }

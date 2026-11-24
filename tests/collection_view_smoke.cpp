@@ -175,6 +175,78 @@ void checkNamesWithoutMetadata()
     expect(snapshot.artists.empty()&&snapshot.files.empty(),"Grouping by filename never modifies persistent metadata");
 }
 
+void checkFilenameArtistMembership()
+{
+    auto fixture=collection();
+    fixture.snapshot.files.resize(1);
+    auto& file=fixture.snapshot.files.front();
+    const auto original=std::filesystem::path(L"C:\\media\\HVR49nlaEAAYmKp.jpg");
+    file.path=original;file.originalName=original.stem().wstring();file.extension=L".jpg";
+    CollectionViewOptions options;options.group=CollectionGroup::artist;options.sort=CollectionSort::artist;
+    const auto metadata=buildCollectionView(fixture.snapshot,{original},options);
+    expect(groupFor(metadata,L"Artist A")!=nullptr,"Stored artist links remain available in metadata view");
+    const auto artistKey=groupFor(metadata,L"Artist A")->key;
+    options.filenameArtists=true;
+    auto view=buildCollectionView(fixture.snapshot,{original},options);
+    expect(view.fileCount==1&&view.artistCount==0&&!groupFor(view,L"Artist A")&&groupFor(view,L"Без художника"),
+        "A restored original name does not retain the old metadata artist in filename view");
+    expect(std::ranges::count_if(view.rows,[](const CollectionEntry& row){return row.group;})==1,
+        "Unknown artist files stay flat rather than retaining stale work/version headings");
+    const auto renamed=std::filesystem::path(L"C:\\media\\Artist A_001_v01_First Light.jpg");
+    file.path=renamed;
+    view=buildCollectionView(fixture.snapshot,{renamed},options);
+    expect(view.artistCount==1&&groupFor(view,L"Artist A")&&groupFor(view,L"Artist A")->key==artistKey,
+        "Filename artist is resolved to the existing registry identity");
+    file.path=original;
+    view=buildCollectionView(fixture.snapshot,{original},options);
+    expect(view.artistCount==0&&groupFor(view,L"Без художника")&&!groupFor(view,L"Artist A"),
+        "Undo or external restoration immediately removes filename artist membership");
+    expect(file.artworkId==L"a1"&&file.versionId==L"version-0"&&fixture.snapshot.artworks.front().artists==std::vector<LibraryId>{L"a"},
+        "Changing view membership never deletes collection metadata");
+    options.filter.artist=L"Artist A";
+    expect(buildCollectionView(fixture.snapshot,{original},options).fileCount==0,
+        "Artist filter ignores an old database link after the filename is restored");
+    options.filter={};
+    options.filter.unassigned=true;
+    expect(buildCollectionView(fixture.snapshot,{original},options).fileCount==1,
+        "Restored filename matches the visible unassigned filter");
+    options.filter={};
+
+    fixture.snapshot.artists[1].fileName=L"hud_B";
+    const std::vector<std::filesystem::path> known{
+        L"C:\\media\\Fox-7.jpg",L"C:\\media\\Лис_2.jpg",L"C:\\media\\hud_B-work.jpg",
+        L"C:\\media\\Title - Лис - alternate.jpg"};
+    view=buildCollectionView(fixture.snapshot,known,options);
+    expect(view.fileCount==4&&view.artistCount==2&&groupFor(view,L"Artist A")->files==3&&groupFor(view,L"Художник Б")->files==1,
+        "Registered aliases and filename names work with short counters and reordered templates");
+    const auto shared=std::filesystem::path(L"C:\\media\\Artist A & Художник Б_001_v01_Shared.png");
+    view=buildCollectionView(fixture.snapshot,{shared},options);
+    expect(view.fileCount==1&&view.artistCount==2&&leafNames(view).size()==2,
+        "Filename coauthors share one global file count");
+    const auto duplicate=std::filesystem::path(L"C:\\media\\Fox & Лис_001_v01_Title.png");
+    view=buildCollectionView(fixture.snapshot,{duplicate},options);
+    expect(view.fileCount==1&&view.artistCount==1&&leafNames(view).size()==1,
+        "Two aliases for one artist do not duplicate a file in that artist group");
+    const std::vector<std::filesystem::path> unknown{
+        L"C:\\media\\HVYDkEbYAAcn-7.jpg",L"C:\\media\\HO_3Yh9WgAF2733.png",
+        L"C:\\media\\randomhash_7.jpg",L"C:\\media\\Artist Aardvark-7.jpg",
+        L"C:\\media\\nekoxl-123456-7.jpg"};
+    view=buildCollectionView(fixture.snapshot,unknown,options);
+    expect(view.fileCount==unknown.size()&&view.artistCount==0&&leafNames(view).size()==unknown.size(),
+        "Short hash suffixes and partial registry names are not invented artists");
+    view=buildCollectionView(fixture.snapshot,{L"C:\\media\\nekoxl-100601298-2740294027.png"},options);
+    expect(view.artistCount==1&&groupFor(view,L"nekoxl"),"Two long social-export IDs still identify an unregistered artist");
+
+    fixture.snapshot.artists.push_back({L"short",L"Artist",L"",L"",0,{}});
+    view=buildCollectionView(fixture.snapshot,{renamed},options);
+    expect(view.artistCount==1&&groupFor(view,L"Artist A")&&!groupFor(view,L"Artist —"),
+        "Longest registered token wins over overlapping shorter artist names");
+    fixture.snapshot.artists.push_back({L"literal",L"Artist A & Partners",L"",L"",0,{}});
+    view=buildCollectionView(fixture.snapshot,{L"C:\\media\\Artist A & Partners_001_v01_Title.png"},options);
+    expect(view.artistCount==1&&groupFor(view,L"Artist A & Partners"),
+        "A registered artist name containing an ampersand remains one identity");
+}
+
 void checkTenThousand()
 {
     Fixture fixture;
@@ -209,6 +281,7 @@ int main()
         checkGroups();
         checkFiltersAndSort();
         checkNamesWithoutMetadata();
+        checkFilenameArtistMembership();
         checkTenThousand();
         std::cout << "Collection view checks passed.\n";
         return 0;

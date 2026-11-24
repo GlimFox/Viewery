@@ -104,6 +104,7 @@ int wmain(int argc,wchar_t** argv)
         click(pane,2205);
         require(events.back().action==SettingsAction::renameModule&&events.back().value==0,"module checkbox emits explicit unchecked value");
         require(!IsWindowEnabled(control(pane,2206)),"template actions disable when module is off");
+        require(!IsWindowEnabled(control(pane,2231)),"artist registry disables when module is off");
         state.renameEnabled=true;settings.update(state);pump();
         const auto eventsBeforeUpdate=events.size();settings.update(state);pump();
         require(events.size()==eventsBeforeUpdate,"state refresh does not emit settings actions");
@@ -113,6 +114,7 @@ int wmain(int argc,wchar_t** argv)
         MSG enterKey{};enterKey.hwnd=control(pane,2206);enterKey.message=WM_KEYDOWN;enterKey.wParam=VK_RETURN;
         require(settings.processMessage(enterKey)&&events.back().action==SettingsAction::templates,"Enter activates a focused settings action");
         click(pane,2206);require(events.back().action==SettingsAction::templates,"template editor is delegated to the owner");
+        click(pane,2231);require(events.back().action==SettingsAction::artists,"artist registry is delegated to the owner");
         click(pane,2207);require(events.back().action==SettingsAction::backupCollection,"database backup is delegated without touching data");
         click(pane,2208);require(events.back().action==SettingsAction::exportMetadata,"metadata export is delegated to the owner");
         click(pane,2209);require(events.back().action==SettingsAction::importMetadata,"metadata import is delegated to the owner");
