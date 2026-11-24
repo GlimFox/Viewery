@@ -4,7 +4,9 @@
 
 ## Коллекция и переименование
 
-Версия Next 0.2.0-beta.7 включает базу художников, очередь нескольких пачек, отдельные окна шаблонов и настроек, локальную коллекцию и историю с Undo после перезапуска.
+Версия Next 0.2.0-beta.8 включает базу художников, очередь нескольких пачек, отдельные окна шаблонов и настроек, локальную коллекцию и историю с Undo после перезапуска.
+
+Значки кнопок рисуются самим приложением и не зависят от системного шрифта иконок. Устанавливать дополнительные шрифты для Viewery не требуется.
 
 ![Предпросмотр Rename Studio на тестовых файлах](docs/images/rename-studio.png)
 
@@ -125,7 +127,7 @@ GIF ограничен палитрой и не содержит звуково�
 Для сборки нужны Visual Studio 2022 или новее с компонентом **Desktop development with C++**, Windows SDK и CMake 3.25+. Генератор Visual Studio 2026 требует CMake 4.2+.
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 "-DVIEWERY_VERSION=0.2.0-beta.7" -DVIEWERY_MEDIA_TESTS=ON
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 "-DVIEWERY_VERSION=0.2.0-beta.8" -DVIEWERY_MEDIA_TESTS=ON
 cmake --build build --config Release --parallel
 .\scripts\Get-MediaTools.ps1 -Destination .\build\bin\Release
 ctest --test-dir build -C Release --output-on-failure
@@ -134,7 +136,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 Для Visual Studio 2026 укажите `-G "Visual Studio 18 2026"`. Для Ninja можно выполнить те же шаги из x64 Developer PowerShell, указав `-G Ninja -DCMAKE_BUILD_TYPE=Release` и каталог `build/bin` для бинарников. Если локализованный инструментарий не проходит пробу компилятора с Ninja, укажите `-DCMAKE_TRY_COMPILE_CONFIGURATION=Release -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded` на этапе конфигурации.
 
-В PowerShell заключайте весь аргумент с номером версии в кавычки: `"-DVIEWERY_VERSION=0.2.0-beta.7"`, `"-DCMAKE_SYSTEM_VERSION=10.0.26100.0"`. Без кавычек PowerShell может разбить такой аргумент и записать в кеш CMake `VIEWERY_VERSION=0`. Некорректный номер теперь останавливает конфигурацию; повторите её с полным номером в кавычках, чтобы заменить прежнее значение кеша.
+В PowerShell заключайте весь аргумент с номером версии в кавычки: `"-DVIEWERY_VERSION=0.2.0-beta.8"`, `"-DCMAKE_SYSTEM_VERSION=10.0.26100.0"`. Без кавычек PowerShell может разбить такой аргумент и записать в кеш CMake `VIEWERY_VERSION=0`. Некорректный номер теперь останавливает конфигурацию; повторите её с полным номером в кавычках, чтобы заменить прежнее значение кеша.
 
 CTest создаёт тестовые PNG, GIF и MP4 без внешних образцов. Проверяются кадры 0,0 → 0,1 → 0,2 → 0,4 → 0,2 секунды в GIF и MP4 с переменной частотой кадров, автопауза, перемотка, масштаб, скорость и громкость. Отдельная проверка запускает FFmpeg для целого видео и фрагмента, проверяет отмену, Unicode в путях и защиту от перезаписи. Для сборки одного приложения оставьте `VIEWERY_MEDIA_TESTS` выключенным.
 
@@ -142,10 +144,12 @@ CTest создаёт тестовые PNG, GIF и MP4 без внешних об
 
 Дополнительные CTest проверяют модель коллекции, безопасное переименование и восстановление журнала, реестр художников и его миграцию, шаблоны, группировку, фильтры, планирование выделения в Проводнике и проверку версий обновления. Проверка 10 000 файлов измеряет индексирование и построение групп без декодирования медиа. [Результаты начального этапа Next и ограничения](docs/NEXT_STATUS.md).
 
+Тест `ui-icons` рисует значки в памяти при разных размерах и DPI, проверяет границы отрисовки и независимость от выбранного шрифта, сохраняет PNG с образцами. Для него не требуется отдельный рабочий стол Windows.
+
 Для проверки нативной панели Rename Studio включите `VIEWERY_GUI_TESTS`. Тест создаёт отдельный рабочий стол Windows и уникальную временную базу в каталоге сборки. Он проверяет назначение метаданных, сохранение шаблона, смену выделения во время предпросмотра, подтверждённое переименование и Undo. Отдельный GUI-тест базы художников проверяет её форму, добавление, переименование и удаление на тестовых файлах. В среде, запрещающей создание отдельного рабочего стола, CTest отмечает эти сценарии как пропущенные.
 
 ```powershell
-cmake -S . -B build "-DVIEWERY_VERSION=0.2.0-beta.7" -DVIEWERY_GUI_TESTS=ON
+cmake -S . -B build "-DVIEWERY_VERSION=0.2.0-beta.8" -DVIEWERY_GUI_TESTS=ON
 cmake --build build --config Release --target viewery-rename-studio-tests viewery-main-ui-tests viewery-artist-registry-tests
 ctest --test-dir build -C Release -R "rename-studio-gui|main-window-gui|artist-registry-gui" --output-on-failure
 ```

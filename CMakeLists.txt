@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.25)
 project(Viewery VERSION 0.2.0 LANGUAGES CXX)
-set(VIEWERY_VERSION "0.2.0-beta.7" CACHE STRING "Semantic version published by Viewery")
+set(VIEWERY_VERSION "0.2.0-beta.8" CACHE STRING "Semantic version published by Viewery")
 if(NOT VIEWERY_VERSION MATCHES "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-beta\\.([1-9][0-9]*))?$")
-    message(FATAL_ERROR "Invalid VIEWERY_VERSION '${VIEWERY_VERSION}'. Expected major.minor.patch or major.minor.patch-beta.N. In PowerShell, quote the entire argument: \"-DVIEWERY_VERSION=0.2.0-beta.7\".")
+    message(FATAL_ERROR "Invalid VIEWERY_VERSION '${VIEWERY_VERSION}'. Expected major.minor.patch or major.minor.patch-beta.N. In PowerShell, quote the entire argument: \"-DVIEWERY_VERSION=0.2.0-beta.8\".")
 endif()
 set(viewery_version_components "${CMAKE_MATCH_1}" "${CMAKE_MATCH_2}" "${CMAKE_MATCH_3}")
 if(NOT "${CMAKE_MATCH_5}" STREQUAL "")
@@ -39,12 +39,12 @@ endfunction()
 add_executable(Viewery WIN32 src/main.cpp src/catalog.cpp src/media.cpp src/explorer.cpp
     src/converter.cpp src/frame_image.cpp src/library.cpp src/rename_template.cpp src/rename_studio.cpp
     src/updater.cpp src/runtime_paths.cpp src/collection_view.cpp src/settings_window.cpp
-    src/artist_registry.cpp src/shell_selection.cpp src/Viewery.rc)
+    src/artist_registry.cpp src/shell_selection.cpp src/ui_icons.cpp src/Viewery.rc)
 set_source_files_properties(src/Viewery.rc PROPERTIES
     OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/Viewery.manifest;${CMAKE_CURRENT_SOURCE_DIR}/src/Viewery.ico")
 viewery_target(Viewery)
 target_link_options(Viewery PRIVATE /MANIFEST:NO)
-target_link_libraries(Viewery PRIVATE advapi32 comctl32 dwmapi gdi32 ole32 oleaut32
+target_link_libraries(Viewery PRIVATE advapi32 comctl32 dwmapi gdi32 msimg32 ole32 oleaut32
     shell32 shlwapi user32 uuid windowscodecs bcrypt winhttp windowsapp runtimeobject uxtheme)
 add_custom_command(TARGET Viewery POST_BUILD COMMAND "${CMAKE_COMMAND}" -E copy_if_different
     "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Get-MediaTools.ps1" "$<TARGET_FILE_DIR:Viewery>/Get-MediaTools.ps1")
@@ -82,6 +82,11 @@ if(BUILD_TESTING)
     viewery_target(viewery-shell-selection-tests)
     target_link_libraries(viewery-shell-selection-tests PRIVATE shell32 ole32)
     add_test(NAME explorer-selection-plan COMMAND viewery-shell-selection-tests)
+    add_executable(viewery-ui-icons-tests tests/ui_icons_smoke.cpp src/ui_icons.cpp src/frame_image.cpp)
+    viewery_target(viewery-ui-icons-tests)
+    target_link_libraries(viewery-ui-icons-tests PRIVATE user32 gdi32 msimg32 ole32 windowscodecs shell32)
+    add_test(NAME ui-icons COMMAND viewery-ui-icons-tests "${CMAKE_BINARY_DIR}/ui-icons-test-data")
+    set_tests_properties(ui-icons PROPERTIES TIMEOUT 120)
 endif()
 option(VIEWERY_MEDIA_TESTS "Enable integration tests with local libmpv and FFmpeg binaries" OFF)
 if(BUILD_TESTING AND VIEWERY_MEDIA_TESTS)
@@ -107,11 +112,11 @@ endif()
 option(VIEWERY_GUI_TESTS "Enable isolated native UI regression checks" OFF)
 if(BUILD_TESTING AND VIEWERY_GUI_TESTS)
     add_executable(viewery-rename-studio-tests tests/rename_studio_smoke.cpp
-        src/rename_studio.cpp src/rename_template.cpp src/library.cpp src/frame_image.cpp src/Viewery.rc)
+        src/rename_studio.cpp src/rename_template.cpp src/library.cpp src/frame_image.cpp src/ui_icons.cpp src/Viewery.rc)
     viewery_target(viewery-rename-studio-tests)
     target_link_options(viewery-rename-studio-tests PRIVATE /MANIFEST:NO)
     target_link_libraries(viewery-rename-studio-tests PRIVATE
-        comctl32 uxtheme dwmapi user32 gdi32 ole32 shell32 windowscodecs bcrypt)
+        comctl32 uxtheme dwmapi user32 gdi32 msimg32 ole32 shell32 windowscodecs bcrypt)
     add_test(NAME rename-studio-gui COMMAND viewery-rename-studio-tests
         "${CMAKE_BINARY_DIR}/studio-gui-test-data")
     set_tests_properties(rename-studio-gui PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
@@ -145,11 +150,11 @@ if(BUILD_TESTING AND VIEWERY_GUI_TESTS)
         src/catalog.cpp src/media.cpp src/explorer.cpp src/converter.cpp src/frame_image.cpp
         src/library.cpp src/rename_template.cpp src/rename_studio.cpp src/updater.cpp
         src/runtime_paths.cpp src/collection_view.cpp src/settings_window.cpp
-        src/artist_registry.cpp src/shell_selection.cpp src/Viewery.rc)
+        src/artist_registry.cpp src/shell_selection.cpp src/ui_icons.cpp src/Viewery.rc)
     viewery_target(viewery-main-ui-tests)
     target_include_directories(viewery-main-ui-tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_link_options(viewery-main-ui-tests PRIVATE /MANIFEST:NO)
-    target_link_libraries(viewery-main-ui-tests PRIVATE advapi32 comctl32 dwmapi gdi32 ole32 oleaut32
+    target_link_libraries(viewery-main-ui-tests PRIVATE advapi32 comctl32 dwmapi gdi32 msimg32 ole32 oleaut32
         shell32 shlwapi user32 uuid windowscodecs bcrypt winhttp windowsapp runtimeobject uxtheme)
     if(VIEWERY_MEDIA_TESTS)
         add_test(NAME main-window-gui COMMAND viewery-main-ui-tests "${CMAKE_BINARY_DIR}/main-ui-test-data" "${fixtures}/sample.mp4")

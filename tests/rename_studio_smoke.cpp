@@ -158,6 +158,59 @@ bool screenshot(HWND host,const fs::path& output) {
     return capture(host,frame)&&saveFramePng(output,frame);
 }
 
+CapturedFrame renderOwnerDrawButton(HWND button,HFONT selectedFont,UINT state=0) {
+    RECT rect{};GetClientRect(button,&rect);
+    CapturedFrame frame;frame.width=rect.right;frame.height=rect.bottom;
+    BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=rect.right;
+    info.bmiHeader.biHeight=-rect.bottom;info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;info.bmiHeader.biCompression=BI_RGB;
+    HDC dc=CreateCompatibleDC(nullptr);void* pixels=nullptr;
+    HBITMAP bitmap=CreateDIBSection(dc,&info,DIB_RGB_COLORS,&pixels,nullptr,0);
+    if(!dc||!bitmap||!pixels) {if(bitmap)DeleteObject(bitmap);if(dc)DeleteDC(dc);throw std::runtime_error("Cannot render artist button fixture");}
+    const auto previousBitmap=SelectObject(dc,bitmap),previousFont=SelectObject(dc,selectedFont);
+    DRAWITEMSTRUCT draw{};draw.CtlType=ODT_BUTTON;draw.CtlID=static_cast<UINT>(GetDlgCtrlID(button));
+    draw.itemAction=ODA_DRAWENTIRE;draw.itemState=state;draw.hwndItem=button;draw.hDC=dc;draw.rcItem=rect;
+    SendMessageW(GetParent(button),WM_DRAWITEM,draw.CtlID,reinterpret_cast<LPARAM>(&draw));
+    const auto* begin=static_cast<const std::uint8_t*>(pixels);
+    frame.bgra.assign(begin,begin+static_cast<std::size_t>(rect.right)*rect.bottom*4);
+    for(std::size_t index=3;index<frame.bgra.size();index+=4) frame.bgra[index]=255;
+    SelectObject(dc,previousFont);SelectObject(dc,previousBitmap);DeleteObject(bitmap);DeleteDC(dc);
+    return frame;
+}
+
+void checkArtistButtonRendering(RenameStudio& studio,HWND host,HFONT font) {
+    const auto pane=studio.window(),button=control(pane,RenameStudio::artistsCommandId);
+    const auto originalHost=bounds(host),originalPane=bounds(pane,host);
+    for(const UINT dpi:{96U,120U,144U}) {
+        RECT area{0,0,MulDiv(510,static_cast<int>(dpi),96),MulDiv(700,static_cast<int>(dpi),96)};
+        SetWindowPos(host,nullptr,0,0,area.right+40,area.bottom+80,SWP_NOZORDER|SWP_NOACTIVATE);
+        studio.show(area,dpi,font);pump();
+        const auto normal=renderOwnerDrawButton(button,static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)));
+        const auto alternate=renderOwnerDrawButton(button,static_cast<HFONT>(GetStockObject(ANSI_FIXED_FONT)));
+        require(normal.bgra==alternate.bgra,"Artist registry icon renders identical pixels with unrelated selected text fonts");
+        const auto colored=[&](const CapturedFrame& frame,COLORREF color) {
+            std::vector<std::size_t> locations;
+            for(std::size_t pixel=0;pixel<frame.bgra.size()/4;++pixel) {
+                const auto offset=pixel*4;
+                if(frame.bgra[offset]==GetBValue(color)&&frame.bgra[offset+1]==GetGValue(color)&&frame.bgra[offset+2]==GetRValue(color)) locations.push_back(pixel);
+            }
+            return locations;
+        };
+        const auto foreground=colored(normal,RGB(241,242,247));
+        require(foreground.size()>12&&std::ranges::all_of(foreground,[&](std::size_t pixel) {
+            const auto x=pixel%static_cast<std::size_t>(normal.width),y=pixel/static_cast<std::size_t>(normal.width);
+            return x>1&&y>1&&x+2<static_cast<std::size_t>(normal.width)&&y+2<static_cast<std::size_t>(normal.height);
+        }),"Artist registry vector icon has visible strokes inside its bounds at every tested DPI");
+        const auto disabled=renderOwnerDrawButton(button,static_cast<HFONT>(GetStockObject(SYSTEM_FONT)),ODS_DISABLED);
+        require(colored(disabled,RGB(149,155,170))==foreground,"Disabled artist registry icon keeps the same readable shape in muted color");
+        const auto resources=GetGuiResources(GetCurrentProcess(),GR_GDIOBJECTS);
+        for(int iteration=0;iteration<64;++iteration) renderOwnerDrawButton(button,static_cast<HFONT>(GetStockObject(ANSI_FIXED_FONT)));
+        require(GetGuiResources(GetCurrentProcess(),GR_GDIOBJECTS)==resources,"Repeated artist registry icon paints release every temporary GDI object");
+    }
+    SetWindowPos(host,nullptr,originalHost.left,originalHost.top,originalHost.right-originalHost.left,originalHost.bottom-originalHost.top,SWP_NOZORDER|SWP_NOACTIVATE);
+    studio.show(originalPane,96,font);pump();
+    require(text(button)==L"База художников","Vector rendering keeps the artist button's readable accessible name");
+}
+
 bool containsPanelBackground(const CapturedFrame& frame) {
     for(std::size_t offset=0;offset+3<frame.bgra.size();offset+=4) {
         if(frame.bgra[offset]==33&&frame.bgra[offset+1]==26&&frame.bgra[offset+2]==23) return true;
@@ -615,6 +668,7 @@ void checkBatchEventsAndArtistButton(HWND host,HFONT font,const fs::path& folder
     const auto requests=artistRegistryRequests;click(pane,RenameStudio::artistsCommandId);
     require(wait([&]{return artistRegistryRequests==requests+1;})&&!studio.takeBatchQueued()&&studio.queuedFileCount()==0,
         "Artist registry button delegates one owner command without changing the pending batch");
+    checkArtistButtonRendering(studio,host,font);
 
     SetWindowTextW(control(pane,1006),L"Shared Alias");click(pane,1041);
     require(studio.busy()&&wait([&]{return !studio.busy();})&&!studio.takeBatchQueued()&&studio.queuedFileCount()==0,
