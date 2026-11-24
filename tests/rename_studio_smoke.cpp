@@ -24,6 +24,7 @@ constexpr int advancedOptions=1052;
 constexpr int liveExample=1054;
 unsigned closeRequests=0;
 unsigned collectionNotifications=0;
+unsigned artistRegistryRequests=0;
 
 HWND control(HWND pane,int id) {
     struct Search {int id;HWND found=nullptr;} search{id};
@@ -40,6 +41,7 @@ HWND control(HWND pane,int id) {
 }
 
 LRESULT CALLBACK hostProcedure(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
+    if(message==WM_COMMAND&&LOWORD(wparam)==RenameStudio::artistsCommandId) {++artistRegistryRequests;return 0;}
     if(message==changed) {++collectionNotifications;return 0;}
     if(message==WM_COMMAND&&LOWORD(wparam)==closeStudio) {
         ++closeRequests;
@@ -232,6 +234,15 @@ void checkScrollingLayout(RenameStudio& studio,HWND host,const fs::path& folder)
                         box.right<=client.right&&box.bottom<=client.bottom;
                 }
                 require(fits,"Navigation and close controls fit at 100, 125 and 150 percent DPI");
+                if(tab==1000) {
+                    const auto artistInput=bounds(control(pane,1006),pane);
+                    const auto registryButton=bounds(control(pane,RenameStudio::artistsCommandId),pane);
+                    require(IsWindowVisible(control(pane,RenameStudio::artistsCommandId))&&registryButton.left>artistInput.right&&
+                        registryButton.top==artistInput.top&&registryButton.right<=viewport.right&&
+                        registryButton.right-registryButton.left==MulDiv(30,static_cast<int>(dpi),96)&&
+                        registryButton.bottom-registryButton.top==MulDiv(30,static_cast<int>(dpi),96),
+                        "Compact artist registry button fits beside the editable artist field at every tested DPI");
+                }
                 bool readable=true;
                 for(int id=1000;id<=1054;++id) {
                     const HWND child=control(pane,id);
@@ -478,6 +489,58 @@ void checkQueuedCycleUndo(HWND host,HFONT font,const fs::path& folder) {
     studio.hide();
 }
 
+void checkBatchEventsAndArtistButton(HWND host,HFONT font,const fs::path& folder) {
+    const auto source=folder/L"batch-event.png",database=folder/L"batch-events.sqlite3";
+    {std::ofstream output(source,std::ios::binary);output<<"batch notification bytes";}
+    CollectionStore registry(database);
+    Artist first;first.name=L"First Artist";first.aliases=L"Shared Alias";registry.saveArtist(first);
+    Artist second;second.name=L"Second Artist";second.aliases=L"Shared Alias";registry.saveArtist(second);
+    RenameStudio studio(host,changed,[]{},database);
+    RECT area{};GetClientRect(host,&area);studio.show(area,96,font);studio.setFiles({source},{source});
+    require(wait([&]{return !studio.busy();})&&!studio.takeBatchQueued(),"Initial indexing never reports a newly approved batch");
+    const auto pane=studio.window(),button=control(pane,RenameStudio::artistsCommandId);
+    require(button&&IsWindowVisible(button)&&text(button)==L"База художников",
+        "Batch artist field has a compact registry button with a readable accessible name");
+    const auto requests=artistRegistryRequests;click(pane,RenameStudio::artistsCommandId);
+    require(wait([&]{return artistRegistryRequests==requests+1;})&&!studio.takeBatchQueued()&&studio.queuedFileCount()==0,
+        "Artist registry button delegates one owner command without changing the pending batch");
+
+    SetWindowTextW(control(pane,1006),L"Shared Alias");click(pane,1041);
+    require(studio.busy()&&wait([&]{return !studio.busy();})&&!studio.takeBatchQueued()&&studio.queuedFileCount()==0,
+        "An asynchronous metadata failure does not report a successfully approved batch");
+    SetWindowTextW(control(pane,1006),L"Batch Artist");SetWindowTextW(control(pane,1013),L"tag=first\r\ntag=second");click(pane,1041);
+    require(!studio.busy()&&!studio.takeBatchQueued()&&studio.queuedFileCount()==0,
+        "Input validation failure does not report a queued batch");
+    SetWindowTextW(control(pane,1013),L"");click(pane,1041);studio.cancel();
+    require(wait([&]{return !studio.busy();})&&!studio.takeBatchQueued(),"A cancelled preparation never reports a completed batch");
+    SetWindowTextW(control(pane,1007),L"Late Cancelled Draft");click(pane,1041);
+    // Leave the worker's completion posted while the UI still accepts Cancel.
+    MSG completion{};bool completed=false;const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+    while(std::chrono::steady_clock::now()<until) {
+        if(PeekMessageW(&completion,pane,WM_APP+431,WM_APP+431,PM_NOREMOVE)) {completed=true;break;}
+        Sleep(5);
+    }
+    require(completed,"Batch preparation finishes before the late-cancellation regression");
+    studio.cancel();
+    require(wait([&]{return !studio.busy();})&&!studio.takeBatchQueued()&&studio.queuedFileCount()==0,
+        "Cancellation before accepting a completed batch preserves checks by keeping the old queue");
+    SetWindowTextW(control(pane,1007),L"Approved Draft");click(pane,1041);
+    require(wait([&]{return !studio.busy()&&studio.queuedFileCount()==1;})&&studio.takeBatchQueued()&&!studio.takeBatchQueued(),
+        "Successful batch approval emits one consumed-once event");
+    const auto frozen=queueNames(pane);
+    click(pane,1012);require(wait([&]{return !studio.busy();})&&!studio.takeBatchQueued()&&queueNames(pane)==frozen,
+        "Saving only metadata preserves approved queue names and emits no batch event");
+    studio.refreshCollection();require(wait([&]{return !studio.busy();})&&!studio.takeBatchQueued()&&queueNames(pane)==frozen,
+        "Read-only registry refresh cannot repeat a consumed batch event");
+    SetWindowTextW(control(pane,1007),L"Replacement Draft");click(pane,1041);
+    require(wait([&]{return !studio.busy()&&studio.queuedFileCount()==1;})&&studio.takeBatchQueued()&&!studio.takeBatchQueued()&&
+        queueNames(pane)!=frozen,"Replacing an approved source emits one event without duplicating its queue row");
+    const auto replaced=queueNames(pane);studio.setFiles({source},{});click(pane,1041);
+    require(!studio.busy()&&!studio.takeBatchQueued()&&queueNames(pane)==replaced,
+        "Attempting another batch without a selection preserves approved rows and emits no stale event");
+    studio.hide();
+}
+
 int wmain(int argc,wchar_t** argv) {
     if(argc!=2) return 2;
     const fs::path folder=fs::absolute(argv[1])/(L"run-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
@@ -503,6 +566,7 @@ int wmain(int argc,wchar_t** argv) {
             CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,0,L"Segoe UI");
         checkArtistRegistryRefresh(host,font,folder);
         checkQueuedCycleUndo(host,font,folder);
+        checkBatchEventsAndArtistButton(host,font,folder);
         const auto one=folder/L"first/imageA01.png",two=folder/L"first/imageA02.png",keep=folder/L"first/keep.png";
         const auto three=folder/L"second/imageB01.png",four=folder/L"second/imageB02.png";
         {std::ofstream f(one,std::ios::binary);f<<"first bytes";}{std::ofstream f(two,std::ios::binary);f<<"second bytes";}

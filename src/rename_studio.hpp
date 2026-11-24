@@ -12,6 +12,7 @@ class RenameStudio {
 public:
     enum class CollectionAction { backup, exportMetadata, importMetadata };
     static constexpr UINT closeCommandId = 1051;
+    static constexpr UINT artistsCommandId = 2232;
     using BeforeFilesChange = std::function<void()>;
     RenameStudio(HWND owner, UINT changedMessage, BeforeFilesChange beforeChange,
                  std::filesystem::path database = {});
@@ -26,6 +27,8 @@ public:
     bool processMessage(MSG& message);
     void collectionAction(CollectionAction action);
     std::size_t queuedFileCount() const;
+    // True once after a completed batch was added or replaced in the queue.
+    bool takeBatchQueued();
     bool busy() const;
     void cancel();
     void setFiles(std::vector<std::filesystem::path> directory, std::vector<std::filesystem::path> selected);

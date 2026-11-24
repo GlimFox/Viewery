@@ -34,7 +34,7 @@ enum Id {
     counterStart, counterScope, previewList, previewSearch, newName, editName, makePreview,
     apply, historyList, undo, recover, cancelTask, dbBackup, metaExport, metaImport, historyDetails,
     closePanel, advancedToggle, presetMenu, liveExample, scrollViewport, scrollContent, newPreset,
-    dataAdvanced, queueRemove, queueClear, batchPresetName
+    dataAdvanced, queueRemove, queueClear, batchPresetName, artistRegistry=RenameStudio::artistsCommandId
 };
 std::wstring text(HWND control) {
     std::wstring result(static_cast<std::size_t>(GetWindowTextLengthW(control))+1,L'\0');
@@ -159,7 +159,7 @@ void fill(HDC dc,RECT rect,COLORREF color) {
 struct RenameStudio::Impl {
     HWND owner=nullptr,window=nullptr,viewport=nullptr,content=nullptr,tips=nullptr,editorHost=nullptr;
     UINT changed=0,dpi=96;
-    HFONT font=nullptr;
+    HFONT font=nullptr,iconFont=nullptr;
     HBRUSH brush=CreateSolidBrush(bg),editBrush=CreateSolidBrush(inputColor);
     std::map<int,HWND> controls;
     std::vector<HWND> labels;
@@ -167,6 +167,7 @@ struct RenameStudio::Impl {
     POINT dragOrigin{};
     bool filling=false,indexPending=false,refreshPending=false,layingOut=false,dragging=false,advanced=false;
     bool templateOnly=false,dataExpanded=false;
+    bool batchQueued=false;
     int deferredUiAction=0;
     bool deferredUiPosted=false;
     Impl* templateParent=nullptr;
@@ -223,7 +224,7 @@ struct RenameStudio::Impl {
                 CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,window,nullptr,GetModuleHandleW(nullptr),nullptr);
             if(tips) {
                 SendMessageW(tips,TTM_SETMAXTIPWIDTH,0,500);
-                for(int id:{closePanel,preset,liveExample,status,blocks,blockUp,blockDown}) {
+                for(int id:{closePanel,preset,liveExample,status,blocks,blockUp,blockDown,artistRegistry}) {
                     TTTOOLINFOW info{sizeof(info)};info.uFlags=TTF_IDISHWND|TTF_SUBCLASS;info.hwnd=window;
                     info.uId=reinterpret_cast<UINT_PTR>(c(id));info.lpszText=LPSTR_TEXTCALLBACKW;
                     SendMessageW(tips,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&info));
@@ -242,6 +243,7 @@ struct RenameStudio::Impl {
         worker.request_stop();
         if(worker.joinable()) worker.join();
         if(window) DestroyWindow(window);
+        if(iconFont) DeleteObject(iconFont);
         DeleteObject(brush);
         DeleteObject(editBrush);
     }
@@ -294,6 +296,7 @@ struct RenameStudio::Impl {
         create(summary,L"STATIC",L"Выбрано 0 файлов",0);
         create(status,L"STATIC",L"",SS_LEFT);
         combo(artist,true);combo(work,true);edit(title);
+        button(RenameStudio::artistsCommandId,L"База художников");
         edit(workNumber);edit(versionNumber,L"1");
         combo(assignment);item(assignment,L"Разные работы");
         item(assignment,L"Версии одной работы");item(assignment,L"К существующей работе");
@@ -400,6 +403,11 @@ struct RenameStudio::Impl {
         for(const auto& [id,control]:controls) {
             (void)id;SendMessageW(control,WM_SETFONT,reinterpret_cast<WPARAM>(font),FALSE);
         }
+        const auto previous=iconFont;
+        iconFont=CreateFontW(-dp(17),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,0,L"Segoe Fluent Icons");
+        SendMessageW(c(RenameStudio::artistsCommandId),WM_SETFONT,reinterpret_cast<WPARAM>(iconFont?iconFont:font),FALSE);
+        if(previous) DeleteObject(previous);
         SendMessageW(c(blocks),LB_SETITEMHEIGHT,0,dp(32));
         for(int id:{assignment,blockKind,blockCase,counterScope}) {
             SendMessageW(c(id),CB_SETITEMHEIGHT,static_cast<WPARAM>(-1),dp(22));
@@ -533,7 +541,8 @@ struct RenameStudio::Impl {
         if(busy()) put(cancelTask,std::max(12,width-132),std::max(0,height-39),120,30);
         if(tab==0) {
             caption(L"Художник",12,6,inside);
-            put(artist,12,29,inside,210);
+            put(artist,12,29,std::max(1,inside-38),210);
+            put(RenameStudio::artistsCommandId,bodyWidth-42,29,30,30);
             int y=68;
             if(!artistOnly) {caption(L"Название · пусто — исходное имя",12,y,inside);put(title,12,y+23,inside);y+=62;}
             caption(L"Выбранные файлы — это",12,y,inside);put(assignment,12,y+23,inside,180);y+=62;
@@ -701,6 +710,10 @@ struct RenameStudio::Impl {
     void finishJob() {
         const bool cancelled=worker.get_stop_token().stop_requested();
         worker.join();
+        if(cancelled&&pending.batchAdded) {
+            pending.replaceQueue=false;pending.batchAdded=false;
+            pending.message=L"Подготовка пачки отменена";
+        }
         if(pending.snapshotLoaded) replaceSnapshot(std::move(pending.snapshot));
         if(!pending.snapshotOnly) {
             presets=std::move(pending.presets);
@@ -712,6 +725,7 @@ struct RenameStudio::Impl {
         if(pending.operationDetails) SetWindowTextW(c(historyDetails),pending.operationDetails->c_str());
         if(pending.clearQueue) preview.clear();
         if(pending.batchAdded) {
+            if(pending.replaceQueue&&!cancelled) batchQueued=true;
             const bool wasFilling=std::exchange(filling,true);
             SetWindowTextW(c(title),L"");SetWindowTextW(c(workNumber),L"");
             filling=wasFilling;
@@ -1184,6 +1198,10 @@ struct RenameStudio::Impl {
         if(id==blocks&&notification==LBN_SELCHANGE) {selectBlock();return;}
         if(notification!=BN_CLICKED) return;
         switch(id) {
+        case RenameStudio::artistsCommandId:
+            if(!templateOnly) PostMessageW(owner,WM_COMMAND,MAKEWPARAM(RenameStudio::artistsCommandId,BN_CLICKED),
+                reinterpret_cast<LPARAM>(c(RenameStudio::artistsCommandId)));
+            break;
         case dataAdvanced:dataExpanded=!dataExpanded;layout();break;
         case queueClear:preview.clear();fillPreview();SetWindowTextW(c(status),L"Очередь очищена. Файлы не изменены.");break;
         case queueRemove: {
@@ -1460,10 +1478,11 @@ struct RenameStudio::Impl {
                 }
                 const bool active=(draw.CtlID==static_cast<UINT>(tabAssign+tab));
                 fill(draw.hDC,draw.rcItem,active?RGB(42,37,69):inputColor);
-                const auto old=SelectObject(draw.hDC,font);
+                const auto old=SelectObject(draw.hDC,draw.CtlID==RenameStudio::artistsCommandId&&iconFont?iconFont:font);
                 SetBkMode(draw.hDC,TRANSPARENT);
                 SetTextColor(draw.hDC,(draw.itemState&ODS_DISABLED)?muted:active?accent:fg);
                 auto value=text(draw.hwndItem);
+                if(draw.CtlID==RenameStudio::artistsCommandId) value=L"\xE77B";
                 RECT bounds=draw.rcItem;bounds.left+=dp(5);bounds.right-=dp(5);
                 DrawTextW(draw.hDC,value.c_str(),static_cast<int>(value.size()),&bounds,
                           DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
@@ -1477,6 +1496,7 @@ struct RenameStudio::Impl {
                     if(control==c(blockUp)) tooltipText=L"Переместить часть выше · Ctrl+↑";
                     else if(control==c(blockDown)) tooltipText=L"Переместить часть ниже · Ctrl+↓";
                     else if(control==c(closePanel)) tooltipText=L"Закрыть панель · Esc";
+                    else if(control==c(RenameStudio::artistsCommandId)) tooltipText=L"База художников · добавить, изменить или удалить";
                     else if(control==c(blocks)) {
                         POINT point{};GetCursorPos(&point);ScreenToClient(control,&point);
                         const auto hit=SendMessageW(control,LB_ITEMFROMPOINT,0,MAKELPARAM(point.x,point.y));
@@ -1553,6 +1573,7 @@ void RenameStudio::collectionAction(CollectionAction action) {
     SendMessageW(impl_->window,WM_COMMAND,MAKEWPARAM(id,BN_CLICKED),reinterpret_cast<LPARAM>(impl_->c(id)));
 }
 std::size_t RenameStudio::queuedFileCount() const {return impl_->preview.size();}
+bool RenameStudio::takeBatchQueued() {return std::exchange(impl_->batchQueued,false);}
 bool RenameStudio::busy() const {return impl_->busy();}
 void RenameStudio::cancel() {impl_->cancelJobs();}
 void RenameStudio::setFiles(std::vector<fs::path> directory,std::vector<fs::path> selected) {
